@@ -1,0 +1,16 @@
+# 忽略数据文件夹内容，但保留目录本身
+datasets/raw/*
+datasets/processed/*
+!datasets/raw/.gitkeep
+!datasets/processed/.gitkeep
+
+# 忽略训练权重与日志
+checkpoints/
+outputs/
+*.pth
+*.pt
+
+# Python 缓存
+__pycache__/
+*.pyc
+.idea/

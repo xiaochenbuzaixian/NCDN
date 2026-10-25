@@ -43,27 +43,25 @@ class SCDMUnet(nn.Module):
         self.time_embed = TimeEmbed(time_dim)
         self.align = InputAlignment()
 
-        # 编码器: 3个下采样 Sample Blocks
         self.block1 = SampleBlock(32, 16, seq_in=256, time_dim=time_dim, mode="downsample")
         self.block2 = SampleBlock(16, 8,  seq_in=128, time_dim=time_dim, mode="downsample")
         self.block3 = SampleBlock(8,  4,  seq_in=64,  time_dim=time_dim, mode="downsample")
 
-        # 解码器: 3个上采样 Sample Blocks
         self.block4 = SampleBlock(4,  8,  seq_in=32,  time_dim=time_dim, mode="upsample")
         self.block5 = SampleBlock(8,  16, seq_in=64,  time_dim=time_dim, mode="upsample")
         self.block6 = SampleBlock(16, 32, seq_in=128, time_dim=time_dim, mode="upsample")
 
-        # EEG 多尺度引导投影
         self.e_down1 = nn.Conv1d(32, 16, kernel_size=2, stride=2)
         self.e_down2 = nn.Conv1d(16, 8,  kernel_size=2, stride=2)
         self.e_down3 = nn.Conv1d(8,  4,  kernel_size=2, stride=2)
 
-        # 全分辨率 (256) 融合输出头：结合 u3, f0, e0 与原始带噪输入 f_t
+        # 仅融合 U-Net 解码特征 u3 与 EEG 条件特征 e0，切断 f_t 的高频作弊短路
+        # 采用较大卷积核 (kernel_size=7, 5) 确保输出符合 fNIRS 的低频平滑物理特性
         self.final_head = nn.Sequential(
-            nn.Conv1d(32 * 3 + 36, 64, kernel_size=3, padding=1),
+            nn.Conv1d(32 * 2, 64, kernel_size=7, padding=3),
             nn.GroupNorm(8, 64),
             nn.GELU(),
-            nn.Conv1d(64, 64, kernel_size=3, padding=1),
+            nn.Conv1d(64, 64, kernel_size=5, padding=2),
             nn.GroupNorm(8, 64),
             nn.GELU(),
             nn.Conv1d(64, 36, kernel_size=1)
@@ -71,7 +69,7 @@ class SCDMUnet(nn.Module):
 
     def forward(self, e_t, f_t, t, topo_ef, topo_fe):
         t_emb = self.time_embed(t)
-        e0, f0 = self.align.forward_align(e_t, f_t)  # [B, 32, 256]
+        e0, f0 = self.align.forward_align(e_t, f_t)
 
         e1 = self.e_down1(e0)
         e2 = self.e_down2(e1)
@@ -85,7 +83,6 @@ class SCDMUnet(nn.Module):
         u2 = self.block5(e2, u1 + d2, t_emb, topo_ef, topo_fe)
         u3 = self.block6(e1, u2 + d1, t_emb, topo_ef, topo_fe)
 
-        # 在 256 分辨率拼接跳跃连接，直接保留高频局部信息
-        full_feat = torch.cat([u3, f0, e0, f_t], dim=1)
-        pred_noise = self.final_head(full_feat)
-        return pred_noise
+        out_feat = torch.cat([u3, e0], dim=1)
+        pred_f0 = self.final_head(out_feat)
+        return pred_f0

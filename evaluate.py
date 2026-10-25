@@ -175,4 +175,5 @@ def evaluate_checkpoint(epoch=100):
     print(f">>> 对比曲线图已保存至: {plot_path}")
 
 if __name__ == "__main__":
-    evaluate_checkpoint(epoch=80)
+    # 直接评估自动保存的最优权重 scdm_hbr_best.pt
+    evaluate_checkpoint(epoch="best")

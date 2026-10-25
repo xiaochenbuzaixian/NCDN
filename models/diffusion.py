@@ -18,6 +18,18 @@ class SCDMDiffusion(nn.Module):
         self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
         self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
 
+    def generate_structured_noise(self, x):
+        """
+        生成与 fNIRS 同频带 (0.01~0.1Hz) 的低频结构化噪声 + 微量白噪声：
+        使噪声与真实血氧信号频谱重叠，彻底封死 U-Net 靠低通滤波从 f_t 作弊的捷径
+        """
+        white = torch.randn_like(x)
+        pad = 12
+        low = F.avg_pool1d(F.pad(white, (pad, pad), mode='reflect'), kernel_size=25, stride=1)
+        low = F.avg_pool1d(F.pad(low, (pad, pad), mode='reflect'), kernel_size=25, stride=1)
+        low = (low - low.mean(dim=-1, keepdim=True)) / (low.std(dim=-1, keepdim=True) + 1e-6)
+        return 0.85 * low + 0.15 * white
+
     def q_sample(self, x_0, t, noise=None):
         if noise is None:
             noise = torch.randn_like(x_0)
@@ -30,41 +42,47 @@ class SCDMDiffusion(nn.Module):
         device = e_0.device
         t = torch.randint(0, self.timesteps, (B,), device=device).long()
 
-        noise_f = torch.randn_like(f_0)
+        # 1. 构造同频带结构化噪声
+        noise_f = self.generate_structured_noise(f_0)
         noise_e = torch.randn_like(e_0)
 
         f_t = self.q_sample(f_0, t, noise_f)
-        e_t = self.q_sample(e_0, t, noise_e)
+        # 50% 概率将 f_t 置为纯结构化噪声，强迫模型必须从 EEG 提取跨模态特征，消除训练-测试偏差
+        mask = (torch.rand(B, 1, 1, device=device) > 0.5).float()
+        f_t = mask * f_t + (1.0 - mask) * noise_f
 
-        # 直接预测目标血氧信号 f_0 (避免 98% 高频白噪声捷径)
+        # 保护 EEG 条件信号不被大时间步彻底摧毁 (仅施加前 10% 强度的微弱加噪)
+        e_t = self.q_sample(e_0, t // 10, noise_e)
+
         pred_f0 = self.unet(e_t, f_t, t, topo_ef, topo_fe)
 
-        # 1. 点对点幅值重建损失 (消除基线漂移)
-        mse_loss = F.mse_loss(pred_f0, f_0)
+        # 损失1: 单试次点对点幅值 MSE
+        trial_mse = F.mse_loss(pred_f0, f_0)
 
-        # 2. 时序波形相关性损失 (最大化皮尔逊相关系数 PCC)
-        pred_norm = pred_f0 - pred_f0.mean(dim=-1, keepdim=True)
-        targ_norm = f_0 - f_0.mean(dim=-1, keepdim=True)
-        cos_sim = F.cosine_similarity(pred_norm, targ_norm, dim=-1, eps=1e-6).mean()
-        pcc_loss = 1.0 - cos_sim
+        # 损失2: 批次群体平均血流响应 (HRF) 误差与趋势相关性约束
+        mean_pred = pred_f0.mean(dim=0)
+        mean_targ = f_0.mean(dim=0)
+        mean_mse = F.mse_loss(mean_pred, mean_targ)
 
-        # 3. 一阶导数平滑损失 (抑制高频毛刺，严格贴合低频血流动力学斜率)
+        curve_pred = pred_f0.mean(dim=(0, 1))
+        curve_targ = f_0.mean(dim=(0, 1))
+        cp_norm = curve_pred - curve_pred.mean()
+        ct_norm = curve_targ - curve_targ.mean()
+        curve_cos = F.cosine_similarity(cp_norm.unsqueeze(0), ct_norm.unsqueeze(0), dim=-1).mean()
+        pcc_loss = 1.0 - curve_cos
+
+        # 损失3: 一阶时序差分平滑约束
         diff_pred = pred_f0[:, :, 1:] - pred_f0[:, :, :-1]
         diff_targ = f_0[:, :, 1:] - f_0[:, :, :-1]
         smooth_loss = F.mse_loss(diff_pred, diff_targ)
 
-        return mse_loss + 0.5 * pcc_loss + 5.0 * smooth_loss
+        return trial_mse + 1.5 * mean_mse + 0.3 * pcc_loss + 2.0 * smooth_loss
 
     @torch.no_grad()
-    def sample(self, e_0, topo_ef, topo_fe, ddim_steps=50):
-        """
-        采用 DDIM 确定性逆向采样:
-        1. 速度提升 20 倍 (50步替代1000步)
-        2. 消除逐步随机白噪声叠加导致的高频锯齿
-        """
+    def sample(self, e_0, topo_ef, topo_fe, ddim_steps=20):
         B = e_0.shape[0]
         device = e_0.device
-        f_t = torch.randn((B, 36, 256), device=device)
+        f_t = self.generate_structured_noise(torch.zeros(B, 36, 256, device=device))
 
         step_indices = torch.linspace(0, self.timesteps - 1, ddim_steps, device=device).long()
         step_indices = torch.flip(step_indices, dims=[0])
@@ -73,10 +91,9 @@ class SCDMDiffusion(nn.Module):
             i = step_indices[idx]
             t = torch.full((B,), i, device=device, dtype=torch.long)
 
-            # 推理阶段使用干净 EEG 或对应时间步微弱加噪引导
-            e_t = self.q_sample(e_0, t)
+            e_t = self.q_sample(e_0, t // 10)
             pred_f0 = self.unet(e_t, f_t, t, topo_ef, topo_fe)
-            pred_f0 = torch.clamp(pred_f0, -4.0, 4.0)
+            pred_f0 = torch.clamp(pred_f0, -3.5, 3.5)
 
             if idx == len(step_indices) - 1:
                 f_t = pred_f0
@@ -85,11 +102,9 @@ class SCDMDiffusion(nn.Module):
                 alpha_bar_t = self.alphas_cumprod[i]
                 alpha_bar_prev = self.alphas_cumprod[i_prev]
 
-                # 从 pred_f0 反推等效噪声并执行 DDIM 确定性步进
                 pred_eps = (f_t - torch.sqrt(alpha_bar_t) * pred_f0) / (torch.sqrt(1.0 - alpha_bar_t) + 1e-8)
                 f_t = torch.sqrt(alpha_bar_prev) * pred_f0 + torch.sqrt(1.0 - alpha_bar_prev) * pred_eps
 
-        # 生理频带平滑滤波 (滤除残余高频毛刺，严格对齐 0.01-0.1Hz 血流平滑度)
         kernel_size = 9
         pad = kernel_size // 2
         f_smooth = F.avg_pool1d(F.pad(f_t, (pad, pad), mode='replicate'), kernel_size=kernel_size, stride=1)

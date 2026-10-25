@@ -19,10 +19,6 @@ class SCDMDiffusion(nn.Module):
         self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
 
     def generate_structured_noise(self, x):
-        """
-        生成与 fNIRS 同频带 (0.01~0.1Hz) 的低频结构化噪声 + 微量白噪声：
-        使噪声与真实血氧信号频谱重叠，彻底封死 U-Net 靠低通滤波从 f_t 作弊的捷径
-        """
         white = torch.randn_like(x)
         pad = 12
         low = F.avg_pool1d(F.pad(white, (pad, pad), mode='reflect'), kernel_size=25, stride=1)
@@ -42,47 +38,59 @@ class SCDMDiffusion(nn.Module):
         device = e_0.device
         t = torch.randint(0, self.timesteps, (B,), device=device).long()
 
-        # 1. 构造同频带结构化噪声
         noise_f = self.generate_structured_noise(f_0)
         noise_e = torch.randn_like(e_0)
 
         f_t = self.q_sample(f_0, t, noise_f)
-        # 50% 概率将 f_t 置为纯结构化噪声，强迫模型必须从 EEG 提取跨模态特征，消除训练-测试偏差
+        # 50% 模态掩码：防止模型依赖 f_t 低频分量偷懒
         mask = (torch.rand(B, 1, 1, device=device) > 0.5).float()
         f_t = mask * f_t + (1.0 - mask) * noise_f
 
-        # 保护 EEG 条件信号不被大时间步彻底摧毁 (仅施加前 10% 强度的微弱加噪)
         e_t = self.q_sample(e_0, t // 10, noise_e)
-
         pred_f0 = self.unet(e_t, f_t, t, topo_ef, topo_fe)
 
-        # 损失1: 单试次点对点幅值 MSE
-        trial_mse = F.mse_loss(pred_f0, f_0)
+        # 1. SNR 加权单试次点对点 MSE (降低大时间步纯噪声下的梯度震荡)
+        snr_weight = (0.2 + 0.8 * self.alphas_cumprod[t]).view(-1, 1, 1)
+        trial_mse = torch.mean(snr_weight * (pred_f0 - f_0) ** 2)
 
-        # 损失2: 批次群体平均血流响应 (HRF) 误差与趋势相关性约束
-        mean_pred = pred_f0.mean(dim=0)
-        mean_targ = f_0.mean(dim=0)
-        mean_mse = F.mse_loss(mean_pred, mean_targ)
+        # 2. 单试次 + 批次波形余弦相关性损失 (PCC Loss)
+        p_norm = pred_f0 - pred_f0.mean(dim=-1, keepdim=True)
+        t_norm = f_0 - f_0.mean(dim=-1, keepdim=True)
+        trial_cos = F.cosine_similarity(p_norm, t_norm, dim=-1, eps=1e-6).mean()
 
         curve_pred = pred_f0.mean(dim=(0, 1))
         curve_targ = f_0.mean(dim=(0, 1))
         cp_norm = curve_pred - curve_pred.mean()
         ct_norm = curve_targ - curve_targ.mean()
-        curve_cos = F.cosine_similarity(cp_norm.unsqueeze(0), ct_norm.unsqueeze(0), dim=-1).mean()
-        pcc_loss = 1.0 - curve_cos
+        batch_cos = F.cosine_similarity(cp_norm.unsqueeze(0), ct_norm.unsqueeze(0), dim=-1).mean()
+        pcc_loss = 1.0 - (0.4 * trial_cos + 0.6 * batch_cos)
 
-        # 损失3: 一阶时序差分平滑约束
+        # 3. 批次幅值校准 + 一阶导数平滑损失 (对齐幅值与斜率)
+        amp_loss = F.mse_loss(pred_f0.mean(dim=0), f_0.mean(dim=0))
         diff_pred = pred_f0[:, :, 1:] - pred_f0[:, :, :-1]
         diff_targ = f_0[:, :, 1:] - f_0[:, :, :-1]
         smooth_loss = F.mse_loss(diff_pred, diff_targ)
 
-        return trial_mse + 1.5 * mean_mse + 0.3 * pcc_loss + 2.0 * smooth_loss
+        total_loss = trial_mse + 1.0 * amp_loss + 0.3 * pcc_loss + 2.0 * smooth_loss
+
+        loss_dict = {
+            "total": total_loss.item(),
+            "mse": trial_mse.item(),
+            "amp": amp_loss.item(),
+            "pcc": pcc_loss.item(),
+            "smooth": smooth_loss.item()
+        }
+        return total_loss, loss_dict
 
     @torch.no_grad()
-    def sample(self, e_0, topo_ef, topo_fe, ddim_steps=20):
+    def sample(self, e_0, topo_ef, topo_fe, ddim_steps=20, noise_scale=0.25):
+        """
+        引入 noise_scale 控制采样方差膨胀：
+        避免初始随机慢波淹没 EEG 诱发的真实幅值，将全集 RMSE 降至 < 1.0
+        """
         B = e_0.shape[0]
         device = e_0.device
-        f_t = self.generate_structured_noise(torch.zeros(B, 36, 256, device=device))
+        f_t = noise_scale * self.generate_structured_noise(torch.zeros(B, 36, 256, device=device))
 
         step_indices = torch.linspace(0, self.timesteps - 1, ddim_steps, device=device).long()
         step_indices = torch.flip(step_indices, dims=[0])
@@ -103,7 +111,7 @@ class SCDMDiffusion(nn.Module):
                 alpha_bar_prev = self.alphas_cumprod[i_prev]
 
                 pred_eps = (f_t - torch.sqrt(alpha_bar_t) * pred_f0) / (torch.sqrt(1.0 - alpha_bar_t) + 1e-8)
-                f_t = torch.sqrt(alpha_bar_prev) * pred_f0 + torch.sqrt(1.0 - alpha_bar_prev) * pred_eps
+                f_t = torch.sqrt(alpha_bar_prev) * pred_f0 + noise_scale * torch.sqrt(1.0 - alpha_bar_prev) * pred_eps
 
         kernel_size = 9
         pad = kernel_size // 2

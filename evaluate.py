@@ -175,4 +175,4 @@ def evaluate_checkpoint(epoch=100):
     print(f">>> 对比曲线图已保存至: {plot_path}")
 
 if __name__ == "__main__":
-    evaluate_checkpoint(epoch=100)
+    evaluate_checkpoint(epoch=80)

@@ -97,7 +97,7 @@ def evaluate_checkpoint(epoch=60):
 
 if __name__ == "__main__":
     # 优先评估 RMSE 最小的第 60 轮
-    evaluate_checkpoint(epoch=60)
+    # evaluate_checkpoint(epoch=60)
 
     # 也可取消注释，对比第 40 轮
-    # evaluate_checkpoint(epoch=40)
+    evaluate_checkpoint(epoch=40)

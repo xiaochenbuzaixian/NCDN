@@ -176,4 +176,4 @@ def evaluate_checkpoint(epoch=100):
 
 if __name__ == "__main__":
     # 直接评估自动保存的最优权重 scdm_hbr_best.pt
-    evaluate_checkpoint(epoch="best")
+    evaluate_checkpoint(epoch=20)

@@ -1,6 +1,6 @@
 project_name: "NCDN_SCDM_Baseline"
 seed: 42
-device: "cuda"
+device: "cuda:1"
 
 data:
   raw_dir: "datasets/raw"

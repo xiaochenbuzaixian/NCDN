@@ -1,119 +1,110 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 class SCDMDiffusion(nn.Module):
-    def __init__(self, unet, timesteps=1000, beta_start=1e-4, beta_end=0.02):
+    def __init__(self, unet, timesteps=200, beta_start=1e-4, beta_end=0.02, schedule="cosine"):
         super().__init__()
         self.unet = unet
         self.timesteps = timesteps
 
-        betas = torch.linspace(beta_start, beta_end, timesteps)
+        if schedule == "cosine":
+            betas = self._cosine_schedule(timesteps)
+        else:
+            betas = torch.linspace(beta_start, beta_end, timesteps)
+
         alphas = 1.0 - betas
-        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alpha_bar = torch.cumprod(alphas, dim=0)
 
         self.register_buffer("betas", betas)
         self.register_buffer("alphas", alphas)
-        self.register_buffer("alphas_cumprod", alphas_cumprod)
-        self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
-        self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
+        self.register_buffer("alpha_bar", alpha_bar)
 
-    def generate_structured_noise(self, x):
-        white = torch.randn_like(x)
-        pad = 12
-        low = F.avg_pool1d(F.pad(white, (pad, pad), mode='reflect'), kernel_size=25, stride=1)
-        low = F.avg_pool1d(F.pad(low, (pad, pad), mode='reflect'), kernel_size=25, stride=1)
-        low = (low - low.mean(dim=-1, keepdim=True)) / (low.std(dim=-1, keepdim=True) + 1e-6)
-        return 0.85 * low + 0.15 * white
+    @staticmethod
+    def _cosine_schedule(T, s=0.008):
+        steps = T + 1
+        t = torch.linspace(0, T, steps) / T
+        alphas_bar = torch.cos((t + s) / (1 + s) * math.pi / 2) ** 2
+        alphas_bar = alphas_bar / alphas_bar[0]
+        betas = 1 - (alphas_bar[1:] / alphas_bar[:-1])
+        return torch.clamp(betas, 0.0001, 0.9999)
 
-    def q_sample(self, x_0, t, noise=None):
+    def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None):
         if noise is None:
-            noise = torch.randn_like(x_0)
-        sqrt_alpha_bar = self.sqrt_alphas_cumprod[t].view(-1, 1, 1)
-        sqrt_one_minus_alpha_bar = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1)
-        return sqrt_alpha_bar * x_0 + sqrt_one_minus_alpha_bar * noise
+            noise = torch.randn_like(x0)
+        ab = self.alpha_bar[t].view(-1, 1, 1)
+        return torch.sqrt(ab) * x0 + torch.sqrt(1.0 - ab) * noise
 
-    def compute_loss(self, e_0, f_0, topo_ef, topo_fe):
-        B = e_0.shape[0]
+    def compute_loss(self, e_0, f_0, topo_ef, topo_fe, topo_ee=None, topo_ff=None):
+        B = e_0.size(0)
         device = e_0.device
+
+        # 1. 拓扑瓶颈先验预测
+        f_prior = self.unet.forward_prior(e_0, topo_ef, topo_fe, topo_ee, topo_ff)
+
+        prior_mse = F.mse_loss(f_prior, f_0)
+
+        # 同时约束单试次全局相关性与逐通道时序相关性
+        p_flat = f_prior.reshape(B, -1)
+        t_flat = f_0.reshape(B, -1)
+        p_norm = p_flat - p_flat.mean(dim=-1, keepdim=True)
+        t_norm = t_flat - t_flat.mean(dim=-1, keepdim=True)
+        sample_pcc = F.cosine_similarity(p_norm, t_norm, dim=-1, eps=1e-6).mean()
+
+        ch_p_norm = f_prior - f_prior.mean(dim=-1, keepdim=True)
+        ch_t_norm = f_0 - f_0.mean(dim=-1, keepdim=True)
+        ch_pcc = F.cosine_similarity(ch_p_norm, ch_t_norm, dim=-1, eps=1e-6).mean()
+        pcc_loss = 1.0 - (0.6 * sample_pcc + 0.4 * ch_pcc)
+
+        curve_mse = F.mse_loss(f_prior.mean(dim=0), f_0.mean(dim=0))
+        diff_loss = F.mse_loss(f_prior[:, :, 1:] - f_prior[:, :, :-1], f_0[:, :, 1:] - f_0[:, :, :-1])
+
+        # 2. 对残差 r_0 = f_0 - f_prior.detach() 进行扩散去噪训练
+        r_0 = f_0 - f_prior.detach()
         t = torch.randint(0, self.timesteps, (B,), device=device).long()
+        noise_r = torch.randn_like(r_0)
+        r_t = self.q_sample(r_0, t, noise_r)
 
-        noise_f = self.generate_structured_noise(f_0)
-        noise_e = torch.randn_like(e_0)
+        noise_pred = self.unet(e_0, r_t, t, topo_ef, topo_fe, topo_ee, topo_ff)
+        noise_mse = F.mse_loss(noise_pred, noise_r)
 
-        f_t = self.q_sample(f_0, t, noise_f)
-        # 50% 模态掩码：防止模型依赖 f_t 低频分量偷懒
-        mask = (torch.rand(B, 1, 1, device=device) > 0.5).float()
-        f_t = mask * f_t + (1.0 - mask) * noise_f
-
-        e_t = self.q_sample(e_0, t // 10, noise_e)
-        pred_f0 = self.unet(e_t, f_t, t, topo_ef, topo_fe)
-
-        # 1. SNR 加权单试次点对点 MSE (降低大时间步纯噪声下的梯度震荡)
-        snr_weight = (0.2 + 0.8 * self.alphas_cumprod[t]).view(-1, 1, 1)
-        trial_mse = torch.mean(snr_weight * (pred_f0 - f_0) ** 2)
-
-        # 2. 单试次 + 批次波形余弦相关性损失 (PCC Loss)
-        p_norm = pred_f0 - pred_f0.mean(dim=-1, keepdim=True)
-        t_norm = f_0 - f_0.mean(dim=-1, keepdim=True)
-        trial_cos = F.cosine_similarity(p_norm, t_norm, dim=-1, eps=1e-6).mean()
-
-        curve_pred = pred_f0.mean(dim=(0, 1))
-        curve_targ = f_0.mean(dim=(0, 1))
-        cp_norm = curve_pred - curve_pred.mean()
-        ct_norm = curve_targ - curve_targ.mean()
-        batch_cos = F.cosine_similarity(cp_norm.unsqueeze(0), ct_norm.unsqueeze(0), dim=-1).mean()
-        pcc_loss = 1.0 - (0.4 * trial_cos + 0.6 * batch_cos)
-
-        # 3. 批次幅值校准 + 一阶导数平滑损失 (对齐幅值与斜率)
-        amp_loss = F.mse_loss(pred_f0.mean(dim=0), f_0.mean(dim=0))
-        diff_pred = pred_f0[:, :, 1:] - pred_f0[:, :, :-1]
-        diff_targ = f_0[:, :, 1:] - f_0[:, :, :-1]
-        smooth_loss = F.mse_loss(diff_pred, diff_targ)
-
-        total_loss = trial_mse + 1.0 * amp_loss + 0.3 * pcc_loss + 2.0 * smooth_loss
-
+        total_loss = noise_mse + 1.0 * prior_mse + 0.8 * pcc_loss + 2.0 * curve_mse + 5.0 * diff_loss
         loss_dict = {
             "total": total_loss.item(),
-            "mse": trial_mse.item(),
-            "amp": amp_loss.item(),
-            "pcc": pcc_loss.item(),
-            "smooth": smooth_loss.item()
+            "noise_mse": noise_mse.item(),
+            "x0_mse": prior_mse.item(),
+            "pcc_loss": (1.0 - sample_pcc).item()
         }
         return total_loss, loss_dict
 
     @torch.no_grad()
-    def sample(self, e_0, topo_ef, topo_fe, ddim_steps=20, noise_scale=0.25):
-        """
-        引入 noise_scale 控制采样方差膨胀：
-        避免初始随机慢波淹没 EEG 诱发的真实幅值，将全集 RMSE 降至 < 1.0
-        """
-        B = e_0.shape[0]
+    def sample(self, e_0, topo_ef, topo_fe, topo_ee=None, topo_ff=None, steps=50, eta=0.0):
+        B = e_0.size(0)
         device = e_0.device
-        f_t = noise_scale * self.generate_structured_noise(torch.zeros(B, 36, 256, device=device))
 
-        step_indices = torch.linspace(0, self.timesteps - 1, ddim_steps, device=device).long()
-        step_indices = torch.flip(step_indices, dims=[0])
+        f_prior = self.unet.forward_prior(e_0, topo_ef, topo_fe, topo_ee, topo_ff)
 
-        for idx in range(len(step_indices)):
-            i = step_indices[idx]
-            t = torch.full((B,), i, device=device, dtype=torch.long)
+        steps = min(steps, self.timesteps)
+        seq = torch.linspace(0, self.timesteps - 1, steps + 1, dtype=torch.long, device=device).flip(0)
 
-            e_t = self.q_sample(e_0, t // 10)
-            pred_f0 = self.unet(e_t, f_t, t, topo_ef, topo_fe)
-            pred_f0 = torch.clamp(pred_f0, -3.5, 3.5)
+        rt = torch.randn(B, 36, 256, device=device)
+        for i in range(len(seq) - 1):
+            t_cur = seq[i]
+            t_next = seq[i + 1]
+            tt = torch.full((B,), t_cur, device=device, dtype=torch.long)
 
-            if idx == len(step_indices) - 1:
-                f_t = pred_f0
-            else:
-                i_prev = step_indices[idx + 1]
-                alpha_bar_t = self.alphas_cumprod[i]
-                alpha_bar_prev = self.alphas_cumprod[i_prev]
+            eps = self.unet(e_0, rt, tt, topo_ef, topo_fe, topo_ee, topo_ff)
+            ab_cur = self.alpha_bar[t_cur].clamp(min=1e-8)
+            ab_next = self.alpha_bar[t_next].clamp(min=1e-8)
 
-                pred_eps = (f_t - torch.sqrt(alpha_bar_t) * pred_f0) / (torch.sqrt(1.0 - alpha_bar_t) + 1e-8)
-                f_t = torch.sqrt(alpha_bar_prev) * pred_f0 + noise_scale * torch.sqrt(1.0 - alpha_bar_prev) * pred_eps
+            r0_pred = ((rt - torch.sqrt(1.0 - ab_cur) * eps) / torch.sqrt(ab_cur)).clamp(-2.5, 2.5)
+            dir_rt = torch.sqrt(torch.clamp(1.0 - ab_next, min=0.0)) * eps
+            rt = torch.sqrt(ab_next) * r0_pred + dir_rt
 
-        kernel_size = 9
-        pad = kernel_size // 2
-        f_smooth = F.avg_pool1d(F.pad(f_t, (pad, pad), mode='replicate'), kernel_size=kernel_size, stride=1)
-        return f_smooth
+        # 低幅值残差注入，避免未见样本上的方差膨胀
+        f_syn = f_prior + 0.05 * rt
+        pad = 4
+        f_syn = F.avg_pool1d(F.pad(f_syn, (pad, pad), mode='replicate'), kernel_size=9, stride=1)
+        f_syn = f_syn - f_syn[:, :, :50].mean(dim=-1, keepdim=True)
+        return f_syn

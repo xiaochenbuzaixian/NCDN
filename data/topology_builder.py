@@ -1,97 +1,135 @@
 import os
-import torch
 import numpy as np
 import scipy.io as sio
+from scipy.signal import resample
+import torch
 import dcor
 from tqdm import tqdm
 
-def get_sensor_grid_coords(raw_dir="datasets/raw"):
-    """
-    读取 mnt.mat 中的 2D 头皮坐标 (x, y) 并离散化映射到 16x16 平面网格
-    若读取失败则采用固定随机拓扑分布
-    """
-    grid_eeg, grid_fnirs = {}, {}
-    try:
-        e_mnt_path = os.path.join(raw_dir, "EEG", "subject 01", "with occular artifact", "mnt.mat")
-        if not os.path.exists(e_mnt_path):
-            e_mnt_path = os.path.join(raw_dir, "EEG", "subject 01", "mnt_artifact.mat")
-        f_mnt_path = os.path.join(raw_dir, "fNIRS", "subject 01", "mnt.mat")
+def _nearest_free(r, c, used):
+    for radius in range(1, 16):
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < 16 and 0 <= nc < 16 and (nr, nc) not in used:
+                    return nr, nc
+    raise RuntimeError("16x16 网格已满")
 
-        e_mnt = sio.loadmat(e_mnt_path, struct_as_record=False, squeeze_me=True)['mnt']
-        f_mnt = sio.loadmat(f_mnt_path, struct_as_record=False, squeeze_me=True)['mnt']
+def load_real_montage(raw_dir="datasets/raw"):
+    """读取 subject 01 的 mnt.mat，在共享坐标系下构建 66 通道无碰撞 16x16 网格映射"""
+    eeg_mnt_path = os.path.join(raw_dir, "EEG", "subject 01", "with occular artifact", "mnt.mat")
+    if not os.path.exists(eeg_mnt_path):
+        eeg_mnt_path = os.path.join(raw_dir, "EEG", "subject 01", "mnt.mat")
+    nirs_mnt_path = os.path.join(raw_dir, "fNIRS", "subject 01", "mnt.mat")
 
-        ex, ey = e_mnt.x[:30], e_mnt.y[:30]
-        fx, fy = f_mnt.x[:36], f_mnt.y[:36]
+    eeg_mnt = sio.loadmat(eeg_mnt_path, struct_as_record=False, squeeze_me=True)['mnt']
+    nirs_mnt = sio.loadmat(nirs_mnt_path, struct_as_record=False, squeeze_me=True)['mnt']
 
-        all_x = np.concatenate([ex, fx])
-        all_y = np.concatenate([ey, fy])
-        min_x, max_x = all_x.min(), all_x.max()
-        min_y, max_y = all_y.min(), all_y.max()
+    eeg_xy = np.column_stack([np.array(eeg_mnt.x).flatten()[:30], np.array(eeg_mnt.y).flatten()[:30]])
+    nirs_xy = np.column_stack([np.array(nirs_mnt.x).flatten()[:36], np.array(nirs_mnt.y).flatten()[:36]])
 
-        for i in range(30):
-            r = int(np.clip((ey[i] - min_y) / (max_y - min_y + 1e-6) * 15, 0, 15))
-            c = int(np.clip((ex[i] - min_x) / (max_x - max_x + 1e-6) * 15, 0, 15))
-            grid_eeg[i] = (r, c)
-        for j in range(36):
-            r = int(np.clip((fy[j] - min_y) / (max_y - min_y + 1e-6) * 15, 0, 15))
-            c = int(np.clip((fx[j] - min_x) / (max_x - min_x + 1e-6) * 15, 0, 15))
-            grid_fnirs[j] = (r, c)
-    except Exception:
-        np.random.seed(42)
-        coords = [(r, c) for r in range(1, 15) for c in range(1, 15)]
-        chosen = np.random.choice(len(coords), 66, replace=False)
-        for i in range(30):
-            grid_eeg[i] = coords[chosen[i]]
-        for j in range(36):
-            grid_fnirs[j] = coords[chosen[30 + j]]
+    all_pos = np.vstack([eeg_xy, nirs_xy]).astype(np.float64)
+    mn, mx = all_pos.min(axis=0), all_pos.max(axis=0)
+    span = np.where((mx - mn) == 0, 1.0, (mx - mn))
+    norm = (all_pos - mn) / span
+    cells = np.clip((norm * 15).round().astype(int), 0, 15)
 
-    return grid_eeg, grid_fnirs
+    used, all_mapping = set(), {}
+    for idx in range(66):
+        r, c = int(cells[idx, 0]), int(cells[idx, 1])
+        if (r, c) in used:
+            r, c = _nearest_free(r, c, used)
+        used.add((r, c))
+        all_mapping[idx] = (r, c)
 
-def build_topology_matrices(processed_dir="datasets/processed", modality="HbR"):
-    eeg_path = os.path.join(processed_dir, "eeg_epochs.pt")
-    fnirs_file = "fnirs_hbr_epochs.pt" if modality == "HbR" else "fnirs_hbo_epochs.pt"
-    fnirs_path = os.path.join(processed_dir, fnirs_file)
+    eeg_coords = {i: all_mapping[i] for i in range(30)}
+    fnirs_coords = {i: all_mapping[30 + i] for i in range(36)}
+    return eeg_coords, fnirs_coords
 
-    eeg = torch.load(eeg_path).numpy()      # [N, 30, 4000]
-    fnirs = torch.load(fnirs_path).numpy()  # [N, 36, 256]
+def distance_correlation_matrix(X, Y):
+    """计算跨模态距离相关矩阵 (Cx, Cy)"""
+    Lx, Ly = X.shape[1], Y.shape[1]
+    if Lx != Ly:
+        L = min(Lx, Ly)
+        if Lx != L:
+            X = resample(X, L, axis=1)
+        if Ly != L:
+            Y = resample(Y, L, axis=1)
+    Cx, Cy = X.shape[0], Y.shape[0]
+    M = np.zeros((Cx, Cy), dtype=np.float32)
+    for i in range(Cx):
+        xi = np.ascontiguousarray(X[i], dtype=np.float64)
+        for j in range(Cy):
+            M[i, j] = dcor.distance_correlation(xi, np.ascontiguousarray(Y[j], dtype=np.float64))
+    return M
 
-    print(f">>> 正在计算 EEG 与 {modality} 的通道间距离相关系数矩阵 (30x36)...")
-    # 取样本均值代表稳态序列计算跨长度相关性
-    e_avg = np.mean(eeg[:300], axis=0)      # [30, 4000]
-    f_avg = np.mean(fnirs[:300], axis=0)    # [36, 256]
+def pearson_matrix(X):
+    """计算模态内皮尔逊相关矩阵 (C, C)"""
+    Xc = X - X.mean(axis=1, keepdims=True)
+    cov = Xc @ Xc.T
+    std = np.sqrt(np.clip(np.diag(cov), 1e-12, None))
+    return (cov / (std[:, None] * std[None, :])).astype(np.float32)
 
-    C_ef = np.zeros((30, 36), dtype=np.float32)
-    for i in tqdm(range(30)):
-        for j in range(36):
-            # 将 EEG 下采样对齐序列分布以加速 dcor 计算或分块计算
-            e_sub = e_avg[i, ::15][:256]
-            C_ef[i, j] = dcor.distance_correlation(e_sub, f_avg[j])
+def project_to_16x16(corr, coords16):
+    Ca, Cb = corr.shape
+    out = np.zeros((Ca, 16, 16), dtype=np.float32)
+    for b in range(Cb):
+        r, c = coords16[b]
+        out[:, r, c] = corr[:, b]
+    return out
 
-    C_fe = C_ef.T  # [36, 30]
-    grid_eeg, grid_fnirs = get_sensor_grid_coords()
+def build_modality_planes(eeg_all, fnirs_all, eeg_coords, fnirs_coords, n_sample_trials=200):
+    """计算跨试次稳健的 4 个 16x16 空间相关平面 (cef, cfe, ce, cf)"""
+    N = len(eeg_all)
+    # 均匀抽取训练集代表性试次计算平均相关矩阵
+    idx = np.linspace(0, int(N * 0.8) - 1, min(n_sample_trials, int(N * 0.8)), dtype=int)
 
-    # 投影到 16x16 平面: C_ef -> [30, 16, 16], C_fe -> [36, 16, 16]
-    topo_ef = np.zeros((30, 16, 16), dtype=np.float32)
-    for i in range(30):
-        for j in range(36):
-            r, c = grid_fnirs[j]
-            topo_ef[i, r, c] = C_ef[i, j]
+    cef_sum = np.zeros((30, 36), dtype=np.float64)
+    ce_sum = np.zeros((30, 30), dtype=np.float64)
+    cf_sum = np.zeros((36, 36), dtype=np.float64)
 
-    topo_fe = np.zeros((36, 16, 16), dtype=np.float32)
-    for j in range(36):
-        for i in range(30):
-            r, c = grid_eeg[i]
-            topo_fe[j, r, c] = C_fe[j, i]
+    for i in tqdm(idx, desc="计算距离相关与皮尔逊平面"):
+        # 降采样至 128 点加速 dcor 计算
+        e_i = resample(eeg_all[i], 128, axis=1)
+        f_i = resample(fnirs_all[i], 128, axis=1)
+        cef_sum += distance_correlation_matrix(e_i, f_i)
+        ce_sum += pearson_matrix(eeg_all[i])
+        cf_sum += pearson_matrix(fnirs_all[i])
 
-    save_path = os.path.join(processed_dir, f"topo_{modality.lower()}.pt")
-    torch.save({
-        "C_ef": torch.tensor(C_ef),
-        "C_fe": torch.tensor(C_fe),
-        "topo_ef": torch.tensor(topo_ef),
-        "topo_fe": torch.tensor(topo_fe)
-    }, save_path)
-    print(f">>> 空间拓扑矩阵已保存至: {save_path}")
+    Cef = (cef_sum / len(idx)).astype(np.float32)
+    Ce = (ce_sum / len(idx)).astype(np.float32)
+    Cf = (cf_sum / len(idx)).astype(np.float32)
+
+    topo_ef = torch.from_numpy(project_to_16x16(Cef, fnirs_coords))     # (30, 16, 16)
+    topo_fe = torch.from_numpy(project_to_16x16(Cef.T, eeg_coords))     # (36, 16, 16)
+    topo_ee = torch.from_numpy(project_to_16x16(Ce, eeg_coords))        # (30, 16, 16)
+    topo_ff = torch.from_numpy(project_to_16x16(Cf, fnirs_coords))      # (36, 16, 16)
+
+    return {
+        "topo_ef": topo_ef,
+        "topo_fe": topo_fe,
+        "topo_ee": topo_ee,
+        "topo_ff": topo_ff,
+        "eeg_coords": eeg_coords,
+        "fnirs_coords": fnirs_coords
+    }
+
+def main():
+    processed_dir = "datasets/processed"
+    eeg_coords, fnirs_coords = load_real_montage("datasets/raw")
+    print(f">>> 成功构建 66 通道共享 16x16 蒙太奇网格 (无碰撞单元数: {len(eeg_coords) + len(fnirs_coords)})")
+
+    eeg_hrf_path = os.path.join(processed_dir, "eeg_hrf_epochs.pt")
+    eeg_path = eeg_hrf_path if os.path.exists(eeg_hrf_path) else os.path.join(processed_dir, "eeg_epochs.pt")
+    eeg_all = torch.load(eeg_path).numpy()
+
+    for mod in ["hbr", "hbo"]:
+        fnirs_all = torch.load(os.path.join(processed_dir, f"fnirs_{mod}_epochs.pt")).numpy()
+        print(f"\n>>> 正在构建 {mod.upper()} 的四个 16x16 空间相关平面 (C_EF, C_FE, C_E, C_F)...")
+        topo_dict = build_modality_planes(eeg_all, fnirs_all, eeg_coords, fnirs_coords)
+        save_path = os.path.join(processed_dir, f"topo_{mod}.pt")
+        torch.save(topo_dict, save_path)
+        print(f">>> 已保存至 {save_path} | C_EF: {topo_dict['topo_ef'].shape}, C_FE: {topo_dict['topo_fe'].shape}")
 
 if __name__ == "__main__":
-    build_topology_matrices(modality="HbR")
-    build_topology_matrices(modality="HbO")
+    main()

@@ -39,19 +39,20 @@ def main():
         beta_end=cfg["model"]["beta_end"]
     ).to(device)
 
+    # 降低初始学习率并加强权重衰减，抑制 10 轮后的平台震荡与过拟合
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=cfg["train"]["lr"],
-        weight_decay=cfg["train"]["weight_decay"]
+        lr=1e-4,
+        weight_decay=1e-3
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg["train"]["epochs"], eta_min=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=80, eta_min=5e-6)
 
-    best_pcc = -1.0
-    print(f">>> 开始训练 SCDM ({modality}) | 设备: {device} | 总轮数: {cfg['train']['epochs']}")
+    best_score = -999.0
+    print(f">>> 开始训练 SCDM ({modality}) | 训练集: {len(train_loader.dataset)} | 独立验证集: {len(val_loader.dataset)}")
 
     for epoch in range(1, cfg["train"]["epochs"] + 1):
         model.train()
-        total_loss = 0.0
+        sums = {"total": 0.0, "mse": 0.0, "amp": 0.0, "pcc": 0.0, "smooth": 0.0}
         pbar = tqdm(train_loader, desc=f"Epoch [{epoch}/{cfg['train']['epochs']}]", leave=False)
 
         for batch in pbar:
@@ -59,20 +60,25 @@ def main():
             f_0 = batch["fnirs"].to(device)
 
             optimizer.zero_grad()
-            loss = model.compute_loss(e_0, f_0, topo_ef, topo_fe)
+            loss, l_dict = model.compute_loss(e_0, f_0, topo_ef, topo_fe)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            total_loss += loss.item()
-            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+            for k in sums:
+                sums[k] += l_dict[k]
+            pbar.set_postfix({"mse": f"{l_dict['mse']:.3f}", "pcc_l": f"{l_dict['pcc']:.3f}"})
 
         scheduler.step()
-        avg_loss = total_loss / len(train_loader)
-        print(f"Epoch [{epoch:03d}/{cfg['train']['epochs']:03d}] | Train Joint Loss: {avg_loss:.4f}")
+        n = len(train_loader)
+        print(
+            f"Ep [{epoch:03d}] | Total: {sums['total']/n:.4f} "
+            f"(MSE: {sums['mse']/n:.4f} | Amp: {sums['amp']/n:.4f} | "
+            f"PCC_L: {sums['pcc']/n:.4f} | Smooth: {sums['smooth']/n:.4f})"
+        )
 
-        # 每 10 轮在完整验证集上进行一次快速评估并保存最优权重
-        if epoch % 10 == 0 or epoch == cfg["train"]["epochs"]:
+        # 每 5 轮在独立验证集上评估一次，精准捕捉最佳泛化点
+        if epoch % 5 == 0 or epoch == cfg["train"]["epochs"]:
             model.eval()
             all_real, all_syn = [], []
             with torch.no_grad():
@@ -86,13 +92,16 @@ def main():
             all_real = np.concatenate(all_real, axis=0)
             all_syn = np.concatenate(all_syn, axis=0)
             metrics = compute_generation_metrics(all_real, all_syn)
-            print(f"  --> [全集验证] RMSE: {metrics['RMSE']:.4f} | 均值曲线 PCC: {metrics['Curve_PCC']:.4f}")
+            rmse, pcc = metrics["RMSE"], metrics["Curve_PCC"]
+            # 综合评价指标：兼顾高 PCC 与低 RMSE
+            score = pcc - 0.5 * rmse
+            print(f"  --> [独立验证集 N={len(all_real)}] RMSE: {rmse:.4f} | 均值曲线 PCC: {pcc:.4f}")
 
-            if metrics["Curve_PCC"] > best_pcc:
-                best_pcc = metrics["Curve_PCC"]
+            if score > best_score:
+                best_score = score
                 best_path = os.path.join(cfg["train"]["checkpoint_dir"], f"scdm_{modality.lower()}_best.pt")
                 torch.save(model.state_dict(), best_path)
-                print(f"  ★ 已刷新最优模型 (Best PCC: {best_pcc:.4f}) -> {best_path}")
+                print(f"  ★ 刷新最优权重 (RMSE: {rmse:.4f}, PCC: {pcc:.4f}) -> {best_path}")
 
             if epoch % cfg["train"]["save_interval"] == 0:
                 ckpt_path = os.path.join(cfg["train"]["checkpoint_dir"], f"scdm_{modality.lower()}_ep{epoch}.pt")

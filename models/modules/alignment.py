@@ -49,7 +49,6 @@ class InputAlignment(nn.Module):
         else:
             e_h = self.eeg_raw_conv(e_t)
             e_feat = F.interpolate(e_h, size=256, mode='linear', align_corners=False)
-
         phase_emb = self.phase_proj(self.phase_clock)
         e_feat = e_feat + phase_emb
         f_feat = self.fnirs_conv(f_t) + phase_emb

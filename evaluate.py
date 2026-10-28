@@ -74,13 +74,11 @@ class MultiPhasefNIRSBranch(nn.Module):
         # 计算相对于 [-5s, 0s] (0:50) 基线期的血流动力学响应变化量
         base = f[:, :, :50].mean(dim=-1, keepdim=True)
         df = f - base
-
         p_early = df[:, :, 50:100].mean(dim=-1)    # 0~5s 初始响应期
         p_peak  = df[:, :, 100:180].mean(dim=-1)   # 5~13s 血流达峰期
         p_late  = df[:, :, 180:250].mean(dim=-1)   # 13~20s 恢复期
         slope_up = p_peak - p_early                # 血流上升斜率
         slope_dn = p_late - p_peak                 # 血流恢复斜率
-
         conv_feat = self.spatial_temporal_conv(df[:, :, 50:])
         raw_feat = torch.cat([conv_feat, p_early, p_peak, p_late, slope_up, slope_dn], dim=-1)
         return self.physio_proj(raw_feat)
@@ -96,7 +94,6 @@ class HybridNet(nn.Module):
         self.eeg = copy.deepcopy(pretrained_eegnet)
         for p in self.eeg.parameters():
             p.requires_grad = False
-
         self.fnirs_branch = MultiPhasefNIRSBranch(n_channels=36, out_dim=32)
         self.fnirs_head = nn.Linear(32, 2)
         self.fusion_head = nn.Sequential(
@@ -112,11 +109,9 @@ class HybridNet(nn.Module):
         with torch.no_grad():
             e_feat = self.eeg.extract_features(e)
             e_logits = self.eeg.fc(e_feat)
-
         f_feat = self.fnirs_branch(f)
         f_logits = self.fnirs_head(f_feat)
         bi_logits = self.fusion_head(torch.cat([e_feat, f_feat], dim=1))
-
         alpha = torch.clamp(self.gate, 0.05, 0.6)
         total_logits = e_logits + alpha * (0.6 * bi_logits + 0.4 * f_logits)
         return total_logits, f_logits, bi_logits
@@ -161,7 +156,6 @@ def train_hybrid(base_model, tr_loader, te_loader, epochs=35, lr=8e-4, device="c
     )
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs)
     crit = nn.CrossEntropyLoss(label_smoothing=0.05)
-
     model.train()
     for _ in range(epochs):
         for e, f, y in tr_loader:
@@ -170,7 +164,6 @@ def train_hybrid(base_model, tr_loader, te_loader, epochs=35, lr=8e-4, device="c
             loss = crit(total_logits, y) + 0.3 * crit(f_logits, y) + 0.3 * crit(bi_logits, y)
             opt.zero_grad(); loss.backward(); opt.step()
         sched.step()
-
     model.eval()
     preds, targets = [], []
     with torch.no_grad():
@@ -185,7 +178,6 @@ def calc_set_metrics(real_arr, synth_arr):
     scale = np.sum(real_arr * synth_arr) / (np.sum(synth_arr ** 2) + 1e-8)
     scale = np.clip(scale, 0.4, 2.5)
     synth_cal = synth_arr * scale
-
     mse = float(np.mean((real_arr - synth_cal) ** 2))
     rmse = float(np.sqrt(mse))
     corrs = [
@@ -220,19 +212,15 @@ def evaluate_checkpoint(epoch="best", ddim_steps=50):
     modality = cfg["data"]["target_modality"]
     processed_dir = cfg["data"]["processed_dir"]
     ckpt_name = f"scdm_{modality.lower()}_best.pt" if str(epoch) == "best" else f"scdm_{modality.lower()}_ep{epoch}.pt"
-
     topo_dict = torch.load(os.path.join(processed_dir, f"topo_{modality.lower()}.pt"), map_location="cpu")
     topo_ef, topo_fe = topo_dict["topo_ef"].to(device), topo_dict["topo_fe"].to(device)
-
     model = SCDMDiffusion(SCDMUnet(128, 64, 6), timesteps=cfg["model"]["timesteps"]).to(device)
     model.load_state_dict(torch.load(os.path.join(cfg["train"]["checkpoint_dir"], ckpt_name), map_location=device))
     model.eval()
-
     eeg_cond = torch.load(os.path.join(processed_dir, "eeg_hrf_epochs.pt"))
     eeg_np = torch.load(os.path.join(processed_dir, "eeg_epochs.pt")).numpy()
     real_target = torch.load(os.path.join(processed_dir, f"fnirs_{modality.lower()}_epochs.pt")).numpy()
     labels_np = torch.load(os.path.join(processed_dir, "labels.pt")).numpy()
-
     print(f">>> 正在使用 SCDM (U-Net+SCG+MTR) DDIM-{ddim_steps} 步采样生成合成 fNIRS...")
     synth_list = []
     with torch.no_grad():
@@ -241,18 +229,14 @@ def evaluate_checkpoint(epoch="best", ddim_steps=50):
                 model.sample(eeg_cond[i:i + 16].to(device), topo_ef, topo_fe, steps=ddim_steps).cpu().numpy()
             )
     synth_raw = np.concatenate(synth_list, axis=0)
-
     g = torch.Generator().manual_seed(42)
     val_idx = torch.randperm(len(labels_np), generator=g).numpy()[int(len(labels_np) * 0.8):]
-
     v_mse, v_rmse, v_spcc, v_cpcc, _ = calc_set_metrics(real_target[val_idx], synth_raw[val_idx])
     a_mse, a_rmse, a_spcc, a_cpcc, synth_all = calc_set_metrics(real_target, synth_raw)
-
     print("\n" + "=" * 75)
     print(f"【1. 信号生成质量评估】 (权重: {ckpt_name})")
     print(f"  [独立验证集 N={len(val_idx)}] MSE: {v_mse:.4f} (RMSE: {v_rmse:.4f}) | 单试次 PCC: {v_spcc:.4f} | 曲线 PCC: {v_cpcc:.4f}")
     print(f"  [全集口径   N={len(real_target)}] MSE: {a_mse:.4f} (RMSE: {a_rmse:.4f}) | 单试次 PCC: {a_spcc:.4f} | 曲线 PCC: {a_cpcc:.4f}")
-
     print("\n>>> 正在运行 5 折 EEGNet / HybridNet 运动想象分类检验...")
     results = {"eeg_only": [], "eeg_real": [], "eeg_synth": []}
     for run in range(5):
@@ -262,7 +246,6 @@ def evaluate_checkpoint(epoch="best", ddim_steps=50):
         f_tr, f_te = torch.from_numpy(real_target[tr]).float(), torch.from_numpy(real_target[te]).float()
         s_tr, s_te = torch.from_numpy(synth_all[tr]).float(), torch.from_numpy(synth_all[te]).float()
         y_tr, y_te = torch.from_numpy(labels_np[tr]), torch.from_numpy(labels_np[te])
-
         base_model, m_eeg = train_eegnet(
             DataLoader(TensorDataset(e_tr, y_tr), 32, shuffle=True),
             DataLoader(TensorDataset(e_te, y_te), 32),
@@ -283,7 +266,6 @@ def evaluate_checkpoint(epoch="best", ddim_steps=50):
         results["eeg_only"].append(m_eeg)
         results["eeg_real"].append(m_real)
         results["eeg_synth"].append(m_syn)
-
     print("\n【2. 下游运动想象 (MI) 分类结果 (5-Run Average)】")
     print(f"{'Mode':<26s} {'ACC':>10s} {'PRE':>10s} {'SEN':>10s} {'SPE':>10s}")
     print("-" * 75)
@@ -300,14 +282,11 @@ def evaluate_checkpoint(epoch="best", ddim_steps=50):
     print("-" * 75)
     print(f"  ★ 真实 fNIRS 增益: +{accs['eeg_real'] - accs['eeg_only']:.2f}% | 合成 fNIRS 增益: +{accs['eeg_synth'] - accs['eeg_only']:.2f}%")
     print("=" * 75)
-
     print_parameter_summary(cfg, ddim_steps)
-
     # 绘制对比曲线 (减去前50点基线对齐展示)
     time_axis = np.arange(256) / 10.0 - 5.0
     r_val = real_target[val_idx] - real_target[val_idx, :, :50].mean(axis=-1, keepdims=True)
     s_val = synth_all[val_idx] - synth_all[val_idx, :, :50].mean(axis=-1, keepdims=True)
-
     plt.figure(figsize=(16, 4.5))
     for i, (m, t) in enumerate([
         (np.ones(len(val_idx), dtype=bool), f"Global Average (PCC: {v_cpcc:.4f})"),

@@ -26,17 +26,13 @@ def get_dataloaders(processed_dir, modality="HbR", batch_size=16, train_ratio=0.
     eeg_hrf = torch.load(hrf_path) if os.path.exists(hrf_path) else eeg
     fnirs = torch.load(os.path.join(processed_dir, f"fnirs_{modality.lower()}_epochs.pt"))
     labels = torch.load(os.path.join(processed_dir, "labels.pt"))
-
     N = len(labels)
     g = torch.Generator().manual_seed(seed)
     perm = torch.randperm(N, generator=g)
-
     n_train = int(N * train_ratio)
     tr_idx, val_idx = perm[:n_train], perm[n_train:]
-
     train_ds = ShinEEGfNIRSDataset(eeg[tr_idx], eeg_hrf[tr_idx], fnirs[tr_idx], labels[tr_idx])
     val_ds = ShinEEGfNIRSDataset(eeg[val_idx], eeg_hrf[val_idx], fnirs[val_idx], labels[val_idx])
-
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
     return train_loader, val_loader

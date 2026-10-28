@@ -7,13 +7,13 @@ data:
   processed_dir: "datasets/processed"
   target_modality: "HbR"        # 可选 "HbR" 或 "HbO"
   eeg_hrf: true                 # 开启 Glover (1999) 双伽马 HRF 神经血管耦合卷积特征
-  batch_size: 16                # V100S 32G 显存可直接跑 16 (等效 safii-74 的 4x4 梯度累积)
+  batch_size: 16                # V100S 32G 显存可直接跑 16
   train_ratio: 0.8
 
 model:
-  spatial: "simple"             # "simple" (SimpleDenoiser+PlanesEncoder) 或 "scg_cross" (原论文U-Net)
+  spatial: "scg_cross"
   temporal: "mtr"
-  base_channels: 128            # ResConv 通道宽度
+  base_channels: 64             # 与 SCDMUnet(128, 64, 6) 严格对齐
   time_dim: 128
   timesteps: 200                # 余弦调度最佳步数 T=200
   schedule: "cosine"            # Improved DDPM 余弦噪声调度
@@ -26,7 +26,7 @@ train:
   warmup_epochs: 20             # 线性预热轮数
   weight_decay: 0.00001
   grad_clip_norm: 1.0
-  ema_decay: 0.999              # EMA 权重平滑系数
+  ema_decay: 0.999
   save_interval: 20
   checkpoint_dir: "checkpoints"
   output_dir: "outputs"

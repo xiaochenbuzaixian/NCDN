@@ -19,13 +19,10 @@ class SCGModule(nn.Module):
         B, _, _ = v_feat.shape
         tq = topo_q.unsqueeze(0) if topo_q.dim() == 3 else topo_q[:1]
         tk = topo_k.unsqueeze(0) if topo_k.dim() == 3 else topo_k[:1]
-
         Q = self.conv2d_q(tq).flatten(2)  # (1, d_in, 256)
         K = self.conv2d_k(tk).flatten(2)  # (1, d_out, 256)
-
         attn_logits = torch.bmm(K, Q.transpose(1, 2)) / math.sqrt(256.0)
         score = F.softmax(attn_logits, dim=-1).expand(B, -1, -1)  # (B, d_out, d_in)
-
         attn_out = torch.bmm(score, v_feat)
         gate = torch.sigmoid(self.gate_conv(v_feat))
         out = self.norm(attn_out * gate + self.res_proj(v_feat))

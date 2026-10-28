@@ -1,18 +1,15 @@
 import io
 import os
+import json
 import numpy as np
 import scipy.io as sio
 from scipy.signal import cheby2, butter, sosfiltfilt, resample, hilbert, fftconvolve
 from scipy.special import gamma as gammafn
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
 import torch
 from tqdm import tqdm
 
 def safe_loadmat(path):
-    """
-    将文件一次性读入内存 BytesIO 后再交由 scipy 解析:
-    1. 避免 Docker/NFS 挂载卷分块流式读取导致的 ZlibInputStream 异常
-    2. 若文件被截断损坏，精准抛出包含文件路径与字节大小的诊断信息
-    """
     if not os.path.exists(path):
         raise FileNotFoundError(f"文件不存在: {path}")
     file_size_mb = os.path.getsize(path) / (1024 * 1024)
@@ -24,7 +21,6 @@ def safe_loadmat(path):
         raise OSError(f"文件损坏或未传输完整: {path} (当前大小: {file_size_mb:.2f} MB) | 原始错误: {e}")
 
 def load_subject_mat_with_fallback(sub_dir, filename):
-    """按优先级依次尝试候选路径，若某路径文件损坏则自动切换备选路径"""
     candidates = [
         os.path.join(sub_dir, "with occular artifact", filename),
         os.path.join(sub_dir, filename),
@@ -37,14 +33,9 @@ def load_subject_mat_with_fallback(sub_dir, filename):
                 return safe_loadmat(p)
             except Exception as e:
                 last_err = e
-                print(f"\n  [警告] 读取失败，尝试备选路径 -> {e}")
-    raise RuntimeError(f"被试目录 {sub_dir} 下的 {filename} 所有候选路径均无法读取！最后错误: {last_err}")
+    raise RuntimeError(f"被试目录 {sub_dir} 下的 {filename} 无法读取: {last_err}")
 
 def canonical_hrf_with_derivative(fs=160.0, duration=25.0):
-    """
-    生成 Glover (1999) 标准双伽马 HRF 核 h(t) 及其一阶时间导数核 dh(t)/dt:
-    双基函数可同时建模单试次血氧响应的【幅值变化】与【达峰潜伏期偏移】
-    """
     t = np.arange(0, duration, 1.0 / fs)
     a1, b1 = 6.0, 1.0
     a2, b2 = 16.0, 1.0
@@ -58,10 +49,7 @@ def canonical_hrf_with_derivative(fs=160.0, duration=25.0):
     return h, dh
 
 def eeg_to_hrf_features(eeg_trial, fs_eeg=160.0, n_out=256):
-    """
-    提取 Mu (8-13Hz) 与 Beta (13-30Hz) 的 ERD/ERS 功率包络，
-    分别与 HRF 主核及导数核卷积，保留正负双向偏侧化动态 -> (30, 256)
-    """
+    """提取 Mu (8-13Hz) 与 Beta (13-30Hz) 相对任务前基线 [-5s, 0s] 的 ERD/ERS 功率包络并卷积双基 HRF"""
     n_ch, n_samp = eeg_trial.shape
     sos_mu = butter(4, [8.0, 13.0], btype='band', fs=fs_eeg, output='sos')
     sos_beta = butter(4, [13.0, 30.0], btype='band', fs=fs_eeg, output='sos')
@@ -81,7 +69,8 @@ def eeg_to_hrf_features(eeg_trial, fs_eeg=160.0, n_out=256):
         c_deriv = fftconvolve(neural_drive[ch], dh, mode='full')[:n_samp]
         out[ch] = c_main + 0.3 * c_deriv
     res = resample(out, n_out, axis=1).astype(np.float32)
-    res = res - res.mean(axis=1, keepdims=True)
+    # 严格对齐任务前 [-5s, 0s] (前50点) 基线归零，保留试次间与通道间的真实幅值差异
+    res = res - res[:, :50].mean(axis=1, keepdims=True)
     return res
 
 def mbll_from_od(od_low, od_high, dpf_low=6.26, dpf_high=5.57, d=3.0):
@@ -132,7 +121,6 @@ def process_single_subject(sub_id, raw_dir):
     sub_str = f"subject {sub_id:02d}"
     eeg_sub_dir = os.path.join(raw_dir, "EEG", sub_str)
     fnirs_sub_dir = os.path.join(raw_dir, "fNIRS", sub_str)
-
     eeg_mat = load_subject_mat_with_fallback(eeg_sub_dir, "cnt.mat")
     eeg_mrk_mat = load_subject_mat_with_fallback(eeg_sub_dir, "mrk.mat")
     fnirs_mat = load_subject_mat_with_fallback(fnirs_sub_dir, "cnt.mat")
@@ -154,8 +142,7 @@ def process_single_subject(sub_id, raw_dir):
         e_raw = np.array(cnt_e.x[:, eeg_idx], dtype=np.float64).T
         e_proc = preprocess_eeg_continuous(e_raw, fs_in=fs_e, fs_out=160.0)
         f_raw = np.array(cnt_f.x, dtype=np.float64)
-        od_low = f_raw[:, :36].T
-        od_high = f_raw[:, 36:72].T
+        od_low, od_high = f_raw[:, :36].T, f_raw[:, 36:72].T
         hbo_cont, hbr_cont = mbll_from_od(od_low, od_high)
         hbo_filt = sosfiltfilt(sos_fnirs, hbo_cont, axis=1)
         hbr_filt = sosfiltfilt(sos_fnirs, hbr_cont, axis=1)
@@ -189,27 +176,14 @@ def main():
     raw_dir = "datasets/raw"
     save_dir = "datasets/processed"
     os.makedirs(save_dir, exist_ok=True)
+    os.makedirs("outputs", exist_ok=True)
     all_eeg, all_hbo, all_hbr, all_labels, all_subs = [], [], [], [], []
-    failed_subjects = []
 
-    print(">>> [Step 1/3] 加载并预处理 Shin2017 数据集 (29 位被试)...")
+    print(">>> [Step 1/4] 加载并预处理 Shin2017 数据集 (29 位被试)...")
     for sub in tqdm(range(1, 30), desc="被试处理进度"):
-        try:
-            e, hbo, hbr, l, s = process_single_subject(sub, raw_dir)
-            all_eeg.append(e)
-            all_hbo.append(hbo)
-            all_hbr.append(hbr)
-            all_labels.append(l)
-            all_subs.append(s)
-        except Exception as err:
-            failed_subjects.append((sub, str(err)))
-            print(f"\n❌ [跳过损坏被试] subject {sub:02d} 读取失败: {err}")
-
-    if len(all_eeg) == 0:
-        raise RuntimeError("没有任何被试数据成功加载，请检查 datasets/raw/ 目录！")
-
-    if failed_subjects:
-        print(f"\n⚠️ 注意：共有 {len(failed_subjects)} 位被试因原始 .mat 文件损坏被跳过，成功加载 {len(all_eeg)} 位被试。")
+        e, hbo, hbr, l, s = process_single_subject(sub, raw_dir)
+        all_eeg.append(e); all_hbo.append(hbo); all_hbr.append(hbr)
+        all_labels.append(l); all_subs.append(s)
 
     eeg = np.concatenate(all_eeg, axis=0)
     hbo = np.concatenate(all_hbo, axis=0)
@@ -217,25 +191,51 @@ def main():
     labels = np.concatenate(all_labels, axis=0)
     subs = np.concatenate(all_subs, axis=0)
 
-    print(">>> [Step 2/3] 执行零均值化与跨通道保留偏侧化标准化 (目标总方差严格=1.0)...")
+    # 生成全局唯一、严格分层的数据集划分索引 (70% 训练, 15% 验证, 15% 留出测试 + 真正的 5-Fold 交叉验证)
+    print(">>> [Step 2/4] 构建全局统一的训练/验证/测试集与严格 5 折交叉验证划分 (消除数据泄漏)...")
+    strata = subs * 2 + labels  # 按 (被试, 类别) 联合分层
+    sss1 = StratifiedShuffleSplit(n_splits=1, test_size=0.30, random_state=42)
+    train_idx, temp_idx = next(sss1.split(eeg, strata))
+    sss2 = StratifiedShuffleSplit(n_splits=1, test_size=0.50, random_state=42)
+    val_rel, test_rel = next(sss2.split(eeg[temp_idx], strata[temp_idx]))
+    val_idx, test_idx = temp_idx[val_rel], temp_idx[test_rel]
+
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    cv_folds = []
+    for f_tr, f_te in skf.split(eeg, strata):
+        cv_folds.append({"train": f_tr.tolist(), "test": f_te.tolist()})
+
+    split_info = {
+        "train_indices": train_idx.tolist(),
+        "val_indices": val_idx.tolist(),
+        "test_indices": test_idx.tolist(),
+        "cv_5fold": cv_folds
+    }
+    with open(os.path.join(save_dir, "split_indices.json"), "w") as f:
+        json.dump(split_info, f)
+
+    print(">>> [Step 3/4] 执行任务前基线归零与基于训练集统计量的标准化 (保留试次间与通道间幅值信息)...")
     for i in range(len(eeg)):
-        mu = eeg[i].mean(axis=1, keepdims=True)
+        mu = eeg[i, :, :800].mean(axis=1, keepdims=True)
         std = eeg[i].std(axis=1, keepdims=True)
         eeg[i] = (eeg[i] - mu) / np.where(std < 1e-8, 1.0, std)
-        for arr in (hbo, hbr):
-            arr[i] = arr[i] - arr[i].mean(axis=1, keepdims=True)
-            ch_std = arr[i].std(axis=1, keepdims=True)
-            gl_std = arr[i].std()
-            comb_std = 0.5 * np.where(ch_std < 1e-8, 1.0, ch_std) + 0.5 * (gl_std if gl_std > 1e-8 else 1.0)
-            arr[i] = arr[i] / comb_std
-            arr[i] = arr[i] / (arr[i].std() + 1e-8)
 
-    print(f">>> [Step 3/3] 提取双基函数 (HRF + 导数核) 双向 ERD/ERS 脑电特征 ({len(eeg)}, 30, 256)...")
+    for arr in (hbo, hbr):
+        # 1. 仅减去任务前 [-5s, 0s] (前50点) 静息基线，绝不减去全时段均值，完整保留任务期响应幅值与偏侧化！
+        arr -= arr[:, :, :50].mean(axis=-1, keepdims=True)
+        # 2. 按每个被试在训练集内的标准差归一化，避免抹平试次间与通道间的运动想象差异
+        for s_id in np.unique(subs):
+            s_mask = (subs == s_id)
+            s_tr_mask = np.intersect1d(np.where(s_mask)[0], train_idx)
+            scale_ref = arr[s_tr_mask].std() if len(s_tr_mask) > 0 else arr[s_mask].std()
+            arr[s_mask] /= max(float(scale_ref), 1e-8)
+
+    print(f">>> [Step 4/4] 提取神经血管耦合特征 ({len(eeg)}, 30, 256)...")
     eeg_hrf = np.empty((len(eeg), 30, 256), dtype=np.float32)
     for i in tqdm(range(len(eeg)), desc="HRF 特征计算"):
         eeg_hrf[i] = eeg_to_hrf_features(eeg[i], fs_eeg=160.0, n_out=256)
-    for i in range(len(eeg_hrf)):
-        eeg_hrf[i] = eeg_hrf[i] / (eeg_hrf[i].std() + 1e-8)
+    hrf_train_std = eeg_hrf[train_idx].std(axis=(0, 2), keepdims=True)
+    eeg_hrf = eeg_hrf / np.maximum(hrf_train_std, 1e-6)
 
     torch.save(torch.from_numpy(eeg), os.path.join(save_dir, "eeg_epochs.pt"))
     torch.save(torch.from_numpy(eeg_hrf), os.path.join(save_dir, "eeg_hrf_epochs.pt"))
@@ -244,13 +244,12 @@ def main():
     torch.save(torch.from_numpy(labels), os.path.join(save_dir, "labels.pt"))
     torch.save(torch.from_numpy(subs), os.path.join(save_dir, "subject_ids.pt"))
 
-    print("\n" + "=" * 60)
-    print(">>> 预处理完成！方差与形状验证:")
-    print(f"  - EEG 原始特征 : {eeg.shape} | std: {eeg.std():.4f}")
-    print(f"  - EEG HRF 特征 : {eeg_hrf.shape} | std: {eeg_hrf.std():.4f}")
-    print(f"  - HbR 特征     : {hbr.shape} | mean: {hbr.mean():.4f}, std: {hbr.std():.4f}")
-    print(f"  - HbO 特征     : {hbo.shape} | mean: {hbo.mean():.4f}, std: {hbo.std():.4f}")
-    print("=" * 60)
+    print("\n" + "=" * 65)
+    print(">>> 预处理完成！严格数据划分与统计验证:")
+    print(f"  - 训练集: {len(train_idx)} | 验证集: {len(val_idx)} | 留出测试集: {len(test_idx)}")
+    print(f"  - HbR [-5s,0s] 基线均值: {hbr[:, :, :50].mean():.6f} | 任务期 std: {hbr[:, :, 50:].std():.4f}")
+    print(f"  - HbO [-5s,0s] 基线均值: {hbo[:, :, :50].mean():.6f} | 任务期 std: {hbo[:, :, 50:].std():.4f}")
+    print("=" * 65)
 
 if __name__ == "__main__":
     main()

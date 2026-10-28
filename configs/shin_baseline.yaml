@@ -1,4 +1,4 @@
-project_name: "NCDN_SCDM_Enhanced"
+project_name: "NCDN_SCDM_Orthodox"
 seed: 42
 device: "cuda"
 
@@ -6,27 +6,27 @@ data:
   raw_dir: "datasets/raw"
   processed_dir: "datasets/processed"
   target_modality: "HbR"        # 可选 "HbR" 或 "HbO"
-  eeg_hrf: true                 # 开启 Glover (1999) 双伽马 HRF 神经血管耦合卷积特征
-  batch_size: 16                # V100S 32G 显存可直接跑 16
-  train_ratio: 0.8
+  eeg_hrf: true                 # 条件输入特征: true 使用神经血管包络特征 (30,256), false 使用原始 EEG (30,4000)
+  batch_size: 16
+  train_ratio: 0.7              # 70% 训练, 15% 验证, 15% 独立留出测试
 
 model:
-  spatial: "scg_cross"
-  temporal: "mtr"
-  base_channels: 64             # 与 SCDMUnet(128, 64, 6) 严格对齐
-  time_dim: 128
-  timesteps: 200                # 余弦调度最佳步数 T=200
-  schedule: "cosine"            # Improved DDPM 余弦噪声调度
+  base_channels: 32             # 严格对齐原论文: 共享表征 (32, 256) -> 16 -> 8 -> 4 -> 8 -> 16 -> 32
+  time_dim: 64
+  n_blocks: 6                   # 严格对齐原论文: 6 个 Sample Blocks (3 Down + 3 Up)
+  timesteps: 200
+  schedule: "cosine"
   beta_start: 0.0001
   beta_end: 0.02
+  prediction_type: "v_or_x0"    # 标准条件扩散目标 (无 0.06 残差缩放)
+  use_prior_branch: false       # 消融开关: false 为标准直接扩散基线, true 为带先验分支消融变体
 
 train:
   epochs: 200
-  lr: 0.0005                    # 峰值学习率 5e-4
-  warmup_epochs: 20             # 线性预热轮数
-  weight_decay: 0.00001
+  lr: 0.0005
+  warmup_epochs: 20
+  weight_decay: 0.0001
   grad_clip_norm: 1.0
-  ema_decay: 0.999
   save_interval: 20
   checkpoint_dir: "checkpoints"
   output_dir: "outputs"

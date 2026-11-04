@@ -34,11 +34,11 @@ class SCDMSampleBlock(nn.Module):
 
 class SCDMUnet(nn.Module):
     """
-    严格对齐原论文的 6-Block SCDM U-Net (堵死 f0 顶层滤波作弊捷径):
+    严格对齐原论文的 6-Block SCDM U-Net:
     - 统一共享表征输入: (B, 32, 256)
     - 3 个编码 Sample Blocks: (32,256) -> (16,128) -> (8,64) -> (4,32)
     - 3 个解码 Sample Blocks: (4,32)  -> (8,64)  -> (16,128) -> (32,256)
-    - 移除顶层 f0 到 temporal_refine 的宽核直连，强制模型必须从 EEG 条件特征 e0 与 6-Block 路径重建血氧响应
+    - 引入时间步自适应门控 (Time-Aware Input Gating)，抑制 t->T 时纯高斯噪声对试次级 EEG 相位的破坏
     """
     def __init__(self, time_dim: int = 64, base_channels: int = 32, n_blocks: int = 6):
         super().__init__()
@@ -46,6 +46,12 @@ class SCDMUnet(nn.Module):
         c = base_channels  # 32
         self.time_embed = TimeEmbed(dim=time_dim)
         self.align = InputAlignment(out_ch=c)
+
+        # 时间步自适应输入调制门 (根据时间步 t 动态平衡加噪状态 f0 与条件表征 e0)
+        self.noise_gate = nn.Sequential(
+            nn.Linear(time_dim, c),
+            nn.Sigmoid()
+        )
 
         # EEG 多尺度条件金字塔投影
         self.e_proj_d1 = nn.Identity()                                      # (32, 256)
@@ -62,7 +68,7 @@ class SCDMUnet(nn.Module):
         self.block5_up   = SCDMSampleBlock(c // 4, c // 2, seq_in=64,  time_dim=time_dim, mode="upsample")
         self.block6_up   = SCDMSampleBlock(c // 2, c,      seq_in=128, time_dim=time_dim, mode="upsample")
 
-        # 局部神经血管导联映射 (仅作用于纯 EEG 条件 e_0，绝不触碰加噪 f_t)
+        # 局部神经血管导联映射 (融合解剖距离亲和度与跨通道偏侧化对比)
         self.spatial_leadfield = nn.Sequential(
             nn.Conv1d(30, 36, kernel_size=5, padding=2),
             nn.GroupNorm(6, 36),
@@ -84,15 +90,18 @@ class SCDMUnet(nn.Module):
         t_emb = self.time_embed(t)
         e0, f0 = self.align.forward_align(e_0, f_t)  # (B, 32, 256)
 
+        # 根据时间步 t 调制输入噪声特征 f0，防止高噪声步随机高斯波动掩盖单试次 EEG 偏侧化特征
+        g_t = self.noise_gate(t_emb).unsqueeze(-1)
+        f_in = g_t * f0 + (1.0 - g_t) * e0
+
         ed1 = self.e_proj_d1(e0)   # (B, 32, 256)
         ed2 = self.e_proj_d2(ed1)  # (B, 16, 128)
         ed3 = self.e_proj_d3(ed2)  # (B, 8, 64)
         eu1 = self.e_proj_u1(ed3)  # (B, 4, 32)
 
-        # 6 个 Sample Blocks 编码-解码路径 (训练时对跳跃连接施加轻微 Dropout，防止绕过深层块)
-        s1 = self.block1_down(f0, ed1, t_emb, topo_ef, topo_fe)
-        s2 = self.block2_down(s1, ed2, t_emb, topo_ef, topo_fe)
-        s3 = self.block3_down(s2, ed3, t_emb, topo_ef, topo_fe)
+        s1 = self.block1_down(f_in, ed1, t_emb, topo_ef, topo_fe)
+        s2 = self.block2_down(s1,   ed2, t_emb, topo_ef, topo_fe)
+        s3 = self.block3_down(s2,   ed3, t_emb, topo_ef, topo_fe)
 
         u4 = self.block4_up(s3,      eu1, t_emb, topo_ef, topo_fe)
         u5 = self.block5_up(u4 + s2, ed3, t_emb, topo_ef, topo_fe)
@@ -108,6 +117,5 @@ class SCDMUnet(nn.Module):
         else:
             e_mapped = self.spatial_leadfield(e_256)
 
-        # 关键修复: 绝不在此处拼接未降噪的 f0，迫使 temporal_refine 100% 依赖 u6 与 EEG 条件特征
         h_final = torch.cat([u6 + e0, e_mapped], dim=1) + self.time_out(t_emb).unsqueeze(-1)
         return self.temporal_refine(h_final)

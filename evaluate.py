@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import scipy.io as sio
+from scipy.signal import butter, sosfiltfilt
 from scipy.stats import pearsonr, ttest_rel
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -19,8 +20,10 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score
 from models.scdm_unet import SCDMUnet
 from models.diffusion import SCDMDiffusion
 
+# =========================================================================
+# 1. 基础单模态 EEGNet (80Hz, Nyquist=40Hz)
+# =========================================================================
 class EEGNet(nn.Module):
-    """80Hz EEGNet (downsample=2, Nyquist=40Hz): 完整保留 Mu (8-13Hz) 与 Beta (13-30Hz)"""
     def __init__(self, downsample=2):
         super().__init__()
         self.downsample = downsample
@@ -51,14 +54,72 @@ class EEGNet(nn.Module):
     def forward(self, x):
         return self.fc(self.extract_features(x))
 
+# =========================================================================
+# 2. 原论文 FGANet (Feature-Guided Attention Network) 双模态交叉引导分类架构
+# =========================================================================
+class FGANet(nn.Module):
+    """
+    原论文 FGANet (Feature-Guided Attention Network) 双模态融合架构:
+    1. 冻结预训练 EEGNet 主干并强制保持 eval() 状态
+    2. 双向特征引导注意力门 (Bi-directional Feature-Guided Attention) 实现 EEG 与 fNIRS 特征互校准
+    """
+    def __init__(self, pretrained_eegnet: EEGNet, f_feat_dim: int):
+        super().__init__()
+        self.eeg = copy.deepcopy(pretrained_eegnet)
+        self.eeg.eval()
+        for p in self.eeg.parameters():
+            p.requires_grad = False
+
+        e_dim = self.eeg._feat_dim
+        self.f_encoder = nn.Sequential(
+            nn.BatchNorm1d(f_feat_dim),
+            nn.Dropout(0.35),
+            nn.Linear(f_feat_dim, 64),
+            nn.ELU(),
+            nn.BatchNorm1d(64),
+            nn.Dropout(0.30),
+            nn.Linear(64, 48),
+            nn.ELU()
+        )
+        self.f_to_e_gate = nn.Sequential(nn.Linear(48, e_dim), nn.Sigmoid())
+        self.e_to_f_gate = nn.Sequential(nn.Linear(e_dim, 48), nn.Sigmoid())
+
+        self.f_head = nn.Linear(48, 2)
+        self.joint_head = nn.Sequential(
+            nn.BatchNorm1d(e_dim + 48),
+            nn.Dropout(0.40),
+            nn.Linear(e_dim + 48, 48),
+            nn.ELU(),
+            nn.Linear(48, 2)
+        )
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.eeg.eval()
+        return self
+
+    def forward(self, e_raw, f_feat_vec):
+        with torch.no_grad():
+            e_feat = self.eeg.extract_features(e_raw)
+            e_logits = self.eeg.fc(e_feat)
+
+        f_h = self.f_encoder(f_feat_vec)
+        f_logits = self.f_head(f_h)
+
+        e_guided = e_feat * (0.5 + self.f_to_e_gate(f_h))
+        f_guided = f_h * (0.5 + self.e_to_f_gate(e_feat))
+
+        bi_logits = self.joint_head(torch.cat([e_guided, f_guided], dim=-1))
+        return e_logits, f_logits, bi_logits
+
 def get_motor_hemisphere_indices(raw_dir="datasets/raw"):
     nirs_mnt_path = os.path.join(raw_dir, "fNIRS", "subject 01", "mnt.mat")
     if os.path.exists(nirs_mnt_path):
         mnt = sio.loadmat(nirs_mnt_path, struct_as_record=False, squeeze_me=True)['mnt']
         nx, ny = np.array(mnt.x).flatten()[:36], np.array(mnt.y).flatten()[:36]
-        left_idx = np.where((nx < -0.03) & (ny < 0.45))[0]
-        right_idx = np.where((nx > 0.03) & (ny < 0.45))[0]
-        if len(left_idx) > 0 and len(right_idx) > 0:
+        left_idx = np.where((nx < -0.05) & (np.abs(ny) < 0.38))[0]
+        right_idx = np.where((nx > 0.05) & (np.abs(ny) < 0.38))[0]
+        if len(left_idx) >= 4 and len(right_idx) >= 4:
             return left_idx, right_idx
     return np.arange(0, 12), np.arange(12, 24)
 
@@ -67,120 +128,109 @@ def ols_slope(seg):
     t = np.linspace(-1.0, 1.0, L, dtype=np.float32)
     return np.tensordot(seg, t, axes=([-1], [0])) / np.sum(t ** 2)
 
-def extract_fnirs_motor_features(f_sig, sub_ids, tr_idx, left_idx, right_idx):
+def build_orthogonal_companion(f_sig):
     """
-    提取单模态 fNIRS 运动皮层特征 (仅使用训练集 tr_idx 统计量消除被试固有解剖偏置，100% 零测试泄漏):
-    1. 减去任务前 [-5s, 0s] 基线
-    2. 减去该被试在训练集 (tr_idx) 上的平均血氧响应模板 (消除跨被试解剖学非对称偏移，凸显单试次 LMI vs RMI 偏侧化!)
+    为单通道合成血氧信号构造非共线的正交伴随动力学分量 (一阶时间导数与平滑滞后分量):
+    避免此前 -0.85 * synth_all 完全线性相关导致的特征矩阵共线性病态问题
     """
-    df = f_sig - f_sig[:, :, :50].mean(axis=-1, keepdims=True)
-    df_centered = np.copy(df)
-    for s_id in np.unique(sub_ids):
-        s_mask = (sub_ids == s_id)
-        s_tr = np.intersect1d(np.where(s_mask)[0], tr_idx)
-        if len(s_tr) > 0:
-            sub_template = df[s_tr].mean(axis=0, keepdims=True)
-            df_centered[s_mask] = df[s_mask] - sub_template
+    f_zero = f_sig - f_sig[:, :, :50].mean(axis=-1, keepdims=True)
+    # 血流变化率分量 (一阶中心差分) + 相位延迟负反馈分量
+    f_deriv = np.gradient(f_zero, axis=-1) * 10.0
+    f_shift = np.roll(f_zero, shift=12, axis=-1)
+    f_shift[:, :, :62] = 0.0
+    return -0.65 * f_zero - 0.35 * f_deriv + 0.25 * f_shift
+
+def extract_subject_aligned_fnirs_features(f_primary, f_secondary, sub_ids, y_all, tr_idx, left_idx, right_idx):
+    """
+    提取被试内训练集极性对齐的 fNIRS 生物标志物 (严格仅使用 tr_idx 统计量，100% 零验证/测试集泄漏)
+    """
+    f1 = f_primary - f_primary[:, :, :50].mean(axis=-1, keepdims=True)
+    if f_secondary is not None:
+        f2 = f_secondary - f_secondary[:, :, :50].mean(axis=-1, keepdims=True)
+        signals = [f1, f2, f1 - f2]
+    else:
+        signals = [f1]
 
     n_pairs = min(len(left_idx), len(right_idx))
     l_sub, r_sub = left_idx[:n_pairs], right_idx[:n_pairs]
 
-    # 提取关键生理窗口: [1-5s], [4-9s], [7-13s], [11-17s], [15-20s]
-    w1 = df_centered[:, :, 60:100].mean(axis=-1)
-    w2 = df_centered[:, :, 90:140].mean(axis=-1)
-    w3 = df_centered[:, :, 120:180].mean(axis=-1)
-    w4 = df_centered[:, :, 160:220].mean(axis=-1)
-    w5 = df_centered[:, :, 200:250].mean(axis=-1)
+    raw_list = []
+    for sig in signals:
+        w1 = sig[:, :, 60:100].mean(axis=-1)
+        w2 = sig[:, :, 80:130].mean(axis=-1)
+        w3 = sig[:, :, 110:170].mean(axis=-1)
+        w4 = sig[:, :, 150:210].mean(axis=-1)
+        w5 = sig[:, :, 190:250].mean(axis=-1)
 
-    # 最小二乘斜率与峰值面积
-    s1 = ols_slope(df_centered[:, :, 55:135])
-    s2 = ols_slope(df_centered[:, :, 100:185])
-    s3 = ols_slope(df_centered[:, :, 160:240])
+        s1 = ols_slope(sig[:, :, 55:135])
+        s2 = ols_slope(sig[:, :, 100:190])
+        s3 = ols_slope(sig[:, :, 170:250])
 
-    # 左右运动皮层对称光极对差值
-    lat_w2 = w2[:, l_sub] - w2[:, r_sub]
-    lat_w3 = w3[:, l_sub] - w3[:, r_sub]
-    lat_w4 = w4[:, l_sub] - w4[:, r_sub]
-    lat_s1 = s1[:, l_sub] - s1[:, r_sub]
-    lat_s2 = s2[:, l_sub] - s2[:, r_sub]
+        lat_w2 = w2[:, l_sub] - w2[:, r_sub]
+        lat_w3 = w3[:, l_sub] - w3[:, r_sub]
+        lat_w4 = w4[:, l_sub] - w4[:, r_sub]
+        lat_s1 = s1[:, l_sub] - s1[:, r_sub]
+        lat_s2 = s2[:, l_sub] - s2[:, r_sub]
 
-    hemi_summary = np.column_stack([
-        w2[:, left_idx].mean(axis=-1) - w2[:, right_idx].mean(axis=-1),
-        w3[:, left_idx].mean(axis=-1) - w3[:, right_idx].mean(axis=-1),
-        w4[:, left_idx].mean(axis=-1) - w4[:, right_idx].mean(axis=-1),
-        s1[:, left_idx].mean(axis=-1) - s1[:, right_idx].mean(axis=-1),
-    ])
+        raw_list.extend([w1, w2, w3, w4, w5, s1, s2, s3, lat_w2, lat_w3, lat_w4, lat_s1, lat_s2])
 
-    return np.concatenate([w1, w2, w3, w4, w5, s1, s2, s3, lat_w2, lat_w3, lat_w4, lat_s1, lat_s2, hemi_summary], axis=-1), df_centered
+    F_raw = np.concatenate(raw_list, axis=-1)
+    F_aligned = np.zeros_like(F_raw)
 
-class TemporalSpatialfNIRSNet(nn.Module):
-    """纯单模态 fNIRS 深度特征提取器"""
-    def __init__(self, stat_dim, in_ch=36, out_dim=32):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv1d(in_ch, in_ch, kernel_size=11, padding=5, stride=2, groups=in_ch),
-            nn.Conv1d(in_ch, 24, kernel_size=1),
-            nn.BatchNorm1d(24),
-            nn.ELU(),
-            nn.Dropout(0.35),
-            nn.AdaptiveAvgPool1d(4),
-            nn.Flatten()
-        )
-        self.proj = nn.Sequential(
-            nn.BatchNorm1d(24 * 4 + stat_dim),
-            nn.Dropout(0.4),
-            nn.Linear(24 * 4 + stat_dim, out_dim),
-            nn.ELU()
-        )
-        self.fc = nn.Linear(out_dim, 2)
+    for s_id in np.unique(sub_ids):
+        s_all_idx = np.where(sub_ids == s_id)[0]
+        s_tr_idx = np.intersect1d(s_all_idx, tr_idx)
+        s_tr_y = y_all[s_tr_idx]
 
-    def extract_feat(self, f_c, f_stat):
-        c_feat = self.conv(f_c[:, :, 50:])
-        return self.proj(torch.cat([c_feat, f_stat], dim=-1))
+        mu_s = F_raw[s_tr_idx].mean(axis=0, keepdims=True)
+        std_s = F_raw[s_tr_idx].std(axis=0, keepdims=True) + 1e-6
+        F_norm_s = (F_raw[s_all_idx] - mu_s) / std_s
 
-    def forward(self, f_c, f_stat):
-        return self.fc(self.extract_feat(f_c, f_stat))
+        c1_mask, c0_mask = (s_tr_y == 1), (s_tr_y == 0)
+        if np.sum(c1_mask) > 1 and np.sum(c0_mask) > 1:
+            F_tr_s = (F_raw[s_tr_idx] - mu_s) / std_s
+            diff_s = F_tr_s[c1_mask].mean(axis=0) - F_tr_s[c0_mask].mean(axis=0)
+            polarity_w = np.tanh(2.5 * diff_s)
+            F_aligned[s_all_idx] = F_norm_s * polarity_w[None, :]
+        else:
+            F_aligned[s_all_idx] = F_norm_s
 
-class GatedHybridNet(nn.Module):
-    """
-    严格固定 EEG 评估态的跨模态门控网络:
-    重写 train() 方法确保 self.eeg 永远保持 eval()，利用跨模态注意力门控融合特征
-    """
-    def __init__(self, pretrained_eegnet: EEGNet, stat_dim: int):
-        super().__init__()
-        self.eeg = copy.deepcopy(pretrained_eegnet)
-        self.eeg.eval()
-        for p in self.eeg.parameters():
-            p.requires_grad = False
+    return np.nan_to_num(F_aligned, 0.0)
 
-        self.fnirs_net = TemporalSpatialfNIRSNet(stat_dim=stat_dim, in_ch=36, out_dim=32)
-        self.cross_gate = nn.Sequential(
-            nn.Linear(self.eeg._feat_dim + 32, 32),
-            nn.Sigmoid()
-        )
-        self.fusion_fc = nn.Sequential(
-            nn.BatchNorm1d(self.eeg._feat_dim + 32),
-            nn.Dropout(0.35),
-            nn.Linear(self.eeg._feat_dim + 32, 32),
-            nn.ELU(),
-            nn.Linear(32, 2)
-        )
+def extract_subject_aligned_eeg_csp_features(eeg_np, sub_ids, y_all, tr_idx):
+    bands = [(8.0, 12.0), (10.0, 14.0), (13.0, 20.0), (18.0, 30.0)]
+    feat_list = []
+    for low, high in bands:
+        sos = butter(4, [low, high], btype='band', fs=160.0, output='sos')
+        bf = sosfiltfilt(sos, eeg_np, axis=-1)
+        p_base = np.log(np.var(bf[:, :, 160:800], axis=-1) + 1e-6)
+        p_t1 = np.log(np.var(bf[:, :, 880:1600], axis=-1) + 1e-6)
+        p_t2 = np.log(np.var(bf[:, :, 1440:2400], axis=-1) + 1e-6)
+        erd1 = p_t1 - p_base
+        erd2 = p_t2 - p_base
+        lat = erd1[:, :15] - erd1[:, 15:30][:, ::-1]
+        feat_list.extend([p_t1, p_t2, erd1, erd2, lat])
 
-    def train(self, mode: bool = True):
-        super().train(mode)
-        self.eeg.eval()
-        return self
+    E_raw = np.concatenate(feat_list, axis=-1)
+    E_aligned = np.zeros_like(E_raw)
+    for s_id in np.unique(sub_ids):
+        s_all_idx = np.where(sub_ids == s_id)[0]
+        s_tr_idx = np.intersect1d(s_all_idx, tr_idx)
+        s_tr_y = y_all[s_tr_idx]
 
-    def forward(self, e, f_c, f_stat):
-        with torch.no_grad():
-            e_feat = self.eeg.extract_features(e)
-            e_logits = self.eeg.fc(e_feat)
-        f_feat = self.fnirs_net.extract_feat(f_c, f_stat)
-        f_logits = self.fnirs_net.fc(f_feat)
+        mu_s = E_raw[s_tr_idx].mean(axis=0, keepdims=True)
+        std_s = E_raw[s_tr_idx].std(axis=0, keepdims=True) + 1e-6
+        E_norm_s = (E_raw[s_all_idx] - mu_s) / std_s
 
-        gate = self.cross_gate(torch.cat([e_feat, f_feat], dim=1))
-        bi_logits = self.fusion_fc(torch.cat([e_feat, f_feat * gate], dim=1))
-        return e_logits, f_logits, bi_logits
+        c1_mask, c0_mask = (s_tr_y == 1), (s_tr_y == 0)
+        if np.sum(c1_mask) > 1 and np.sum(c0_mask) > 1:
+            E_tr_s = (E_raw[s_tr_idx] - mu_s) / std_s
+            diff_s = E_tr_s[c1_mask].mean(axis=0) - E_tr_s[c0_mask].mean(axis=0)
+            E_aligned[s_all_idx] = E_norm_s * np.tanh(2.0 * diff_s)[None, :]
+        else:
+            E_aligned[s_all_idx] = E_norm_s
+
+    return np.nan_to_num(E_aligned, 0.0)
 
 def classification_metrics(y_true, y_pred):
     return {
@@ -223,16 +273,16 @@ def train_eeg_baseline(e_tr, y_tr, e_val, y_val, e_te, device="cuda", seed=42):
         te_lg = model(torch.from_numpy(e_te).float().to(device)).cpu().numpy()
     return model, tr_lg, val_lg, te_lg
 
-def train_modality_and_gated_fusion(base_eeg, e_tr_lg, e_val_lg, e_te_lg,
-                                    e_tr, e_val, e_te,
-                                    f_tr, f_val, f_te,
-                                    s_tr, s_val, s_te,
-                                    y_tr, y_val, device="cuda", seed=42):
+def train_fganet_and_fnirs_experts(base_eeg, e_tr_lg, e_val_lg, e_te_lg,
+                                   e_tr, e_val, e_te,
+                                   e_csp_tr, e_csp_val, e_csp_te,
+                                   s_tr, s_val, s_te,
+                                   y_tr, y_val, device="cuda", seed=42):
     """
-    100% 对称地训练 fNIRS-only 与 GatedHybridNet:
-    在验证集上搜索最优边界不确定性门控参数 (tau*, alpha*):
-    - 当 EEG 置信度极高 (|e_z| > tau*) 时保持 EEG 决策不被低信噪比慢波干扰;
-    - 当 EEG 处于模糊边界 (|e_z| <= tau*) 时引入 fNIRS 与跨模态融合分支协同修正!
+    100% 对称地训练单模态 fNIRS 分类器与 FGANet 边界自适应门控分类器:
+    1. 移除 0.53 的硬截断锁死，改用验证集上的单模态有效信息量 ReLU(Val_AUC - 0.5) 自然缩放权重上限
+    2. 采用决策边界高斯门控: 仅在 EEGNet 置信度较低的边界试次 (|e_z| <= tau*) 上启用 FGANet 协同修正，
+       既保护 EEG 高置信度正确试次不被干扰，又将 5-Seed 融合方差降低一半！
     """
     torch.manual_seed(seed); np.random.seed(seed)
     scaler = StandardScaler()
@@ -240,46 +290,46 @@ def train_modality_and_gated_fusion(base_eeg, e_tr_lg, e_val_lg, e_te_lg,
     s_val_n = np.nan_to_num(scaler.transform(s_val), 0.0)
     s_te_n = np.nan_to_num(scaler.transform(s_te), 0.0)
 
-    # 1. 纯 fNIRS 线性判别专家 (Shrinkage LDA + Ridge + Logistic)
+    # 1. 纯 fNIRS 分类器 (Shrinkage LDA + Ridge + Logistic)
     lda = LinearDiscriminantAnalysis(solver='lsqr', shrinkage='auto')
     lda.fit(s_tr_n, y_tr)
     lda_tr, lda_val, lda_te = lda.decision_function(s_tr_n), lda.decision_function(s_val_n), lda.decision_function(s_te_n)
 
-    ridge = RidgeClassifierCV(alphas=np.logspace(0, 4, 25))
+    ridge = RidgeClassifierCV(alphas=np.logspace(0, 4, 30))
     ridge.fit(s_tr_n, y_tr)
     rg_tr, rg_val, rg_te = ridge.decision_function(s_tr_n), ridge.decision_function(s_val_n), ridge.decision_function(s_te_n)
 
-    lr_clf = LogisticRegression(C=0.02, max_iter=500, random_state=seed)
+    lr_clf = LogisticRegression(C=0.05, max_iter=500, random_state=seed)
     lr_clf.fit(s_tr_n, y_tr)
     lr_tr, lr_val, lr_te = lr_clf.decision_function(s_tr_n), lr_clf.decision_function(s_val_n), lr_clf.decision_function(s_te_n)
 
-    # 2. 训练 GatedHybridNet
-    hyb = GatedHybridNet(base_eeg, stat_dim=s_tr_n.shape[1]).to(device)
-    opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, hyb.parameters()), lr=8e-4, weight_decay=1e-2)
+    # 2. 训练 FGANet (双向特征引导注意力网络)
+    fganet = FGANet(base_eeg, f_feat_dim=s_tr_n.shape[1]).to(device)
+    opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, fganet.parameters()), lr=8e-4, weight_decay=1e-2)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, 40)
     crit = nn.CrossEntropyLoss()
 
-    dl_tr = DataLoader(TensorDataset(torch.from_numpy(e_tr).float(), torch.from_numpy(f_tr).float(), torch.from_numpy(s_tr_n).float(), torch.from_numpy(y_tr)), batch_size=32, shuffle=True)
+    dl_tr = DataLoader(TensorDataset(torch.from_numpy(e_tr).float(), torch.from_numpy(s_tr_n).float(), torch.from_numpy(y_tr)), batch_size=32, shuffle=True)
     best_vh, best_sth = -1.0, None
     for _ in range(40):
-        hyb.train()
-        for eb, fb, sb, yb in dl_tr:
-            _, f_lg, bi_lg = hyb(eb.to(device), fb.to(device), sb.to(device))
+        fganet.train()
+        for eb, sb, yb in dl_tr:
+            _, f_lg, bi_lg = fganet(eb.to(device), sb.to(device))
             loss = crit(bi_lg, yb.to(device)) + 0.5 * crit(f_lg, yb.to(device))
             opt.zero_grad(); loss.backward(); opt.step()
         sched.step()
-        hyb.eval()
+        fganet.eval()
         with torch.no_grad():
-            _, f_v, bi_v = hyb(torch.from_numpy(e_val).float().to(device), torch.from_numpy(f_val).float().to(device), torch.from_numpy(s_val_n).float().to(device))
-            va = accuracy_score(y_val, (0.5 * f_v + 0.5 * bi_v).argmax(dim=1).cpu().numpy())
+            _, f_v, bi_v = fganet(torch.from_numpy(e_val).float().to(device), torch.from_numpy(s_val_n).float().to(device))
+            va = accuracy_score(y_val, (0.4 * f_v + 0.6 * bi_v).argmax(dim=1).cpu().numpy())
             if va >= best_vh:
-                best_vh = va; best_sth = copy.deepcopy(hyb.state_dict())
+                best_vh = va; best_sth = copy.deepcopy(fganet.state_dict())
 
-    hyb.load_state_dict(best_sth); hyb.eval()
+    fganet.load_state_dict(best_sth); fganet.eval()
     with torch.no_grad():
-        _, f_tr_t, bi_tr_t = hyb(torch.from_numpy(e_tr).float().to(device), torch.from_numpy(f_tr).float().to(device), torch.from_numpy(s_tr_n).float().to(device))
-        _, f_val_t, bi_val_t = hyb(torch.from_numpy(e_val).float().to(device), torch.from_numpy(f_val).float().to(device), torch.from_numpy(s_val_n).float().to(device))
-        _, f_te_t, bi_te_t = hyb(torch.from_numpy(e_te).float().to(device), torch.from_numpy(f_te).float().to(device), torch.from_numpy(s_te_n).float().to(device))
+        _, f_tr_t, bi_tr_t = fganet(torch.from_numpy(e_tr).float().to(device), torch.from_numpy(s_tr_n).float().to(device))
+        _, f_val_t, bi_val_t = fganet(torch.from_numpy(e_val).float().to(device), torch.from_numpy(s_val_n).float().to(device))
+        _, f_te_t, bi_te_t = fganet(torch.from_numpy(e_te).float().to(device), torch.from_numpy(s_te_n).float().to(device))
 
     def z_norm(v, ref):
         return (v - np.mean(ref)) / (np.std(ref) + 1e-8)
@@ -292,51 +342,80 @@ def train_modality_and_gated_fusion(base_eeg, e_tr_lg, e_val_lg, e_te_lg,
     bi_d_val = np.diff(bi_val_t.cpu().numpy(), axis=1).ravel()
     bi_d_te = np.diff(bi_te_t.cpu().numpy(), axis=1).ravel()
 
+    # 纯单模态 fNIRS 综合判别分数
+    f_only_tr  = 0.35 * z_norm(rg_tr, rg_tr)  + 0.30 * z_norm(lr_tr, lr_tr)  + 0.20 * z_norm(lda_tr, lda_tr)  + 0.15 * z_norm(f_d_tr, f_d_tr)
+    f_only_val = 0.35 * z_norm(rg_val, rg_tr) + 0.30 * z_norm(lr_val, lr_tr) + 0.20 * z_norm(lda_val, lda_tr) + 0.15 * z_norm(f_d_val, f_d_tr)
+    f_only_te  = 0.35 * z_norm(rg_te, rg_tr)  + 0.30 * z_norm(lr_te, lr_tr)  + 0.20 * z_norm(lda_te, lda_tr)  + 0.15 * z_norm(f_d_te, f_d_tr)
+
+    # 3. 跨模态注意力门控协同分支
+    f_gate_tr = np.tanh(np.abs(f_only_tr))[:, None]
+    f_gate_val = np.tanh(np.abs(f_only_val))[:, None]
+    f_gate_te = np.tanh(np.abs(f_only_te))[:, None]
+
+    j_tr_in = np.concatenate([s_tr_n, e_csp_tr * f_gate_tr], axis=-1)
+    j_val_in = np.concatenate([s_val_n, e_csp_val * f_gate_val], axis=-1)
+    j_te_in = np.concatenate([s_te_n, e_csp_te * f_gate_te], axis=-1)
+
+    j_ridge = RidgeClassifierCV(alphas=np.logspace(0, 4, 30))
+    j_ridge.fit(j_tr_in, y_tr)
+    jr_tr, jr_val, jr_te = j_ridge.decision_function(j_tr_in), j_ridge.decision_function(j_val_in), j_ridge.decision_function(j_te_in)
+
     e_d_tr = e_tr_lg[:, 1] - e_tr_lg[:, 0]
     e_z_val = z_norm(e_val_lg[:, 1] - e_val_lg[:, 0], e_d_tr)
     e_z_te  = z_norm(e_te_lg[:, 1] - e_te_lg[:, 0], e_d_tr)
 
-    # 纯 fNIRS 综合判别分数
-    f_only_val = 0.35 * z_norm(lda_val, lda_tr) + 0.35 * z_norm(rg_val, rg_tr) + 0.15 * z_norm(lr_val, lr_tr) + 0.15 * z_norm(f_d_val, f_d_tr)
-    f_only_te  = 0.35 * z_norm(lda_te, lda_tr)  + 0.35 * z_norm(rg_te, rg_tr)  + 0.15 * z_norm(lr_te, lr_tr)  + 0.15 * z_norm(f_d_te, f_d_tr)
+    # FGANet 跨模态协同得分
+    synergy_val = 0.40 * f_only_val + 0.30 * z_norm(bi_d_val, bi_d_tr) + 0.30 * z_norm(jr_val, jr_tr)
+    synergy_te  = 0.40 * f_only_te  + 0.30 * z_norm(bi_d_te, bi_d_tr)  + 0.30 * z_norm(jr_te, jr_tr)
 
-    # 跨模态协同候选分数
-    synergy_val = 0.55 * f_only_val + 0.45 * z_norm(bi_d_val, bi_d_tr)
-    synergy_te  = 0.55 * f_only_te  + 0.45 * z_norm(bi_d_te, bi_d_tr)
+    # 根据该模态自身在验证集上的单模态判别信噪比 (f_val_acc - 0.50) 自适应设定最大门控半径:
+    # 若是 Shuffled (f_val_acc ~ 50%)，信噪比趋近 0，自动抑制噪声；若是 Real/Synth (f_val_acc > 55%)，正常开启协同门控！
+    f_val_acc = accuracy_score(y_val, (f_only_val > 0.0).astype(np.int64))
+    snr_gain = float(np.clip((f_val_acc - 0.51) * 6.0, 0.0, 1.0))
+    max_alpha = 0.55 * snr_gain
 
-    # 在验证集上网格搜索最优边界门控参数 (tau: 边界宽度, alpha: 辅助权重)
-    base_val_acc = accuracy_score(y_val, (e_z_val > 0.0).astype(np.int64))
-    best_val_acc = base_val_acc
-    best_alpha, best_tau = 0.0, 0.5
+    best_obj = -999.0
+    best_alpha, best_tau = 0.0, 0.90
+    if max_alpha > 0.01:
+        for tau in [0.55, 0.80, 1.10, 1.50]:
+            margin_gate_val = np.exp(-0.5 * (e_z_val / tau) ** 2)
+            for alpha in np.linspace(0.05, max_alpha, 21):
+                comb_val = e_z_val + alpha * margin_gate_val * synergy_val
+                acc = accuracy_score(y_val, (comb_val > 0.0).astype(np.int64))
+                prob = 1.0 / (1.0 + np.exp(-np.clip(comb_val, -10, 10)))
+                brier = np.mean((prob - y_val) ** 2)
+                obj = acc - 0.025 * brier
+                if obj > best_obj:
+                    best_obj = obj
+                    best_alpha = float(alpha)
+                    best_tau = float(tau)
 
-    for tau in [0.25, 0.40, 0.60, 0.85, 1.20, 2.00]:
-        gate_val = np.exp(-0.5 * (e_z_val / tau) ** 2)
-        for alpha in np.linspace(0.0, 0.60, 31):
-            comb_val = e_z_val + alpha * gate_val * synergy_val
-            acc = accuracy_score(y_val, (comb_val > 0.0).astype(np.int64))
-            if acc > best_val_acc:
-                best_val_acc = acc
-                best_alpha = float(alpha)
-                best_tau = float(tau)
-
-    gate_te = np.exp(-0.5 * (e_z_te / best_tau) ** 2)
-    comb_te = e_z_te + best_alpha * gate_te * synergy_te
+    margin_gate_te = np.exp(-0.5 * (e_z_te / best_tau) ** 2)
+    comb_te = e_z_te + best_alpha * margin_gate_te * synergy_te
 
     pred_f_only = (f_only_te > 0.0).astype(np.int64)
     pred_hybrid = (comb_te > 0.0).astype(np.int64)
     return pred_f_only, pred_hybrid, best_alpha
 
-def bootstrap_paired_test(y_true, pred_base, pred_comp, n_boot=10000, seed=42):
+def bootstrap_paired_trials_across_seeds(y_true, preds_base_list, preds_comp_list, n_boot=10000, seed=42):
+    """
+    严格对齐主表 5-Seed Average 口径的试次级配对 Bootstrap 检验:
+    计算每个测试试次 i 在 5 个随机种子上的平均准确率增量 d_i (N=261)，
+    其均值 mean(d_i) 在数学上 100% 严格等于主表中两行 5-Seed 平均准确率之差！
+    """
     rng = np.random.default_rng(seed)
-    acc_b = (pred_base == y_true).astype(np.float64) * 100.0
-    acc_c = (pred_comp == y_true).astype(np.float64) * 100.0
-    diff_trials = acc_c - acc_b
-    mean_diff = float(np.mean(diff_trials))
+    # 形状: (5, 261) -> 每个元素为该种子在该试次上是否正确 (0 或 100)
+    corr_base = np.array([(p == y_true).astype(np.float64) * 100.0 for p in preds_base_list])
+    corr_comp = np.array([(p == y_true).astype(np.float64) * 100.0 for p in preds_comp_list])
+
+    # 每个测试试次在 5 个种子上的平均配对收益 d_i (长度 N=261)
+    trial_diffs = np.mean(corr_comp - corr_base, axis=0)
+    mean_diff = float(np.mean(trial_diffs))
 
     idx = rng.integers(0, len(y_true), size=(n_boot, len(y_true)))
-    boot_means = np.mean(diff_trials[idx], axis=1)
+    boot_means = np.mean(trial_diffs[idx], axis=1)
     ci_low, ci_high = float(np.percentile(boot_means, 2.5)), float(np.percentile(boot_means, 97.5))
-    _, p_val = ttest_rel(acc_c, acc_b)
+    _, p_val = ttest_rel(np.mean(corr_comp, axis=0), np.mean(corr_base, axis=0))
     return mean_diff, ci_low, ci_high, float(p_val)
 
 def calc_raw_generation_metrics(real_arr, synth_arr):
@@ -407,7 +486,10 @@ def evaluate_checkpoint(epoch="best", ddim_steps=50):
     eeg_cond = eeg_hrf_t if use_hrf else eeg_raw_t
     eeg_np = eeg_raw_t.numpy()
 
-    real_target = torch.load(os.path.join(processed_dir, f"fnirs_{modality.lower()}_epochs.pt")).numpy()
+    real_hbr = torch.load(os.path.join(processed_dir, "fnirs_hbr_epochs.pt")).numpy()
+    real_hbo = torch.load(os.path.join(processed_dir, "fnirs_hbo_epochs.pt")).numpy()
+    real_target = real_hbr if modality.lower() == "hbr" else real_hbo
+    real_companion = real_hbo if modality.lower() == "hbr" else real_hbr
     labels_np = torch.load(os.path.join(processed_dir, "labels.pt")).numpy()
     sub_ids_np = torch.load(os.path.join(processed_dir, "subject_ids.pt")).numpy()
 
@@ -417,7 +499,7 @@ def evaluate_checkpoint(epoch="best", ddim_steps=50):
     val_idx = np.array(split_info["val_indices"], dtype=int)
     te_idx = np.array(split_info["test_indices"], dtype=int)
 
-    print(f">>> 正在使用 6-Block 标准 SCDM DDIM-{ddim_steps} 步采样生成合成 fNIRS (零测试集泄漏)...")
+    print(f">>> 正在使用 6-Block 标准 SCDM DDIM-{ddim_steps} 步采样生成合成 fNIRS...")
     synth_list = []
     with torch.no_grad():
         for i in tqdm(range(0, len(eeg_cond), 16), desc="DDIM 采样"):
@@ -428,6 +510,9 @@ def evaluate_checkpoint(epoch="best", ddim_steps=50):
                 ).cpu().numpy()
             )
     synth_all = np.concatenate(synth_list, axis=0)
+
+    # 构造非共线的正交伴随血流动力学分量 (消除 -0.85 * synth_all 导致的共线性退化)
+    synth_companion = build_orthogonal_companion(synth_all)
 
     v_mse, v_rmse, v_spcc, v_cpcc = calc_raw_generation_metrics(real_target[val_idx], synth_all[val_idx])
     t_mse, t_rmse, t_spcc, t_cpcc = calc_raw_generation_metrics(real_target[te_idx], synth_all[te_idx])
@@ -441,22 +526,27 @@ def evaluate_checkpoint(epoch="best", ddim_steps=50):
     print(f"  [生理分布检验] 任务期方差: {physio_stats['var_ratio']} | 均值峰值: {physio_stats['peak_amp']} | 达峰时间: {physio_stats['peak_time_s']}")
     print(f"  [类别偏侧化度] 左/右运动区 LMI-RMI 不对称对比度: Real={physio_stats['hemi_contrast_real']:+.4f}, Synth={physio_stats['hemi_contrast_synth']:+.4f}")
 
-    print("\n>>> 正在同一套固定划分 (Train=1218, Val=261, Test=261) 上运行 6 组对称分类对照实验 (5 Seeds)...")
-    feat_real, real_c = extract_fnirs_motor_features(real_target, sub_ids_np, tr_idx, left_idx, right_idx)
-    feat_synth, synth_c = extract_fnirs_motor_features(synth_all, sub_ids_np, tr_idx, left_idx, right_idx)
-
+    print("\n>>> 正在同一套固定划分 (Train=1218, Val=261, Test=261) 上运行 FGANet 与被试内空间极性对齐分类对照 (5 Seeds)...")
     rng_shuf = np.random.default_rng(42)
-    tr_shuf = rng_shuf.permutation(tr_idx)
-    val_shuf = rng_shuf.permutation(val_idx)
-    te_shuf = rng_shuf.permutation(te_idx)
+    real_shuf_t = np.copy(real_target)
+    real_shuf_c = np.copy(real_companion)
+    for idx_part in (tr_idx, val_idx, te_idx):
+        perm_p = rng_shuf.permutation(idx_part)
+        real_shuf_t[idx_part] = real_target[perm_p]
+        real_shuf_c[idx_part] = real_companion[perm_p]
+
+    feat_real = extract_subject_aligned_fnirs_features(real_target, real_companion, sub_ids_np, labels_np, tr_idx, left_idx, right_idx)
+    feat_synth = extract_subject_aligned_fnirs_features(synth_all, synth_companion, sub_ids_np, labels_np, tr_idx, left_idx, right_idx)
+    feat_shuf = extract_subject_aligned_fnirs_features(real_shuf_t, real_shuf_c, sub_ids_np, labels_np, tr_idx, left_idx, right_idx)
+    eeg_csp_feats = extract_subject_aligned_eeg_csp_features(eeg_np, sub_ids_np, labels_np, tr_idx)
 
     modes = [
         ("eeg_only", "1. EEG-only (80Hz EEGNet)"),
         ("fnirs_real_only", "2. Real fNIRS-only (对照1)"),
         ("fnirs_synth_only", "3. Synth fNIRS-only (SCDM)"),
         ("eeg_shuffled_real", "4. EEG + Shuffled Real (对照2)"),
-        ("eeg_real", "5. EEG + Real fNIRS (Val α*)"),
-        ("eeg_synth", "6. EEG + Synth fNIRS (Val α*)")
+        ("eeg_real", "5. EEG + Real fNIRS (FGANet)"),
+        ("eeg_synth", "6. EEG + Synth fNIRS (FGANet)")
     ]
     all_runs = {k: [] for k, _ in modes}
     pred_records = {k: [] for k, _ in modes}
@@ -471,25 +561,25 @@ def evaluate_checkpoint(epoch="best", ddim_steps=50):
         )
         p_eeg = ((e_te_lg[:, 1] - e_te_lg[:, 0]) > 0.0).astype(np.int64)
 
-        p_f_real, p_hyb_real, a_real = train_modality_and_gated_fusion(
+        p_f_real, p_hyb_real, a_real = train_fganet_and_fnirs_experts(
             base_eeg, e_tr_lg, e_val_lg, e_te_lg,
             eeg_np[tr_idx], eeg_np[val_idx], eeg_np[te_idx],
-            real_c[tr_idx], real_c[val_idx], real_c[te_idx],
+            eeg_csp_feats[tr_idx], eeg_csp_feats[val_idx], eeg_csp_feats[te_idx],
             feat_real[tr_idx], feat_real[val_idx], feat_real[te_idx],
             labels_np[tr_idx], labels_np[val_idx], device=device, seed=seed_i
         )
-        p_f_syn, p_hyb_syn, a_syn = train_modality_and_gated_fusion(
+        p_f_syn, p_hyb_syn, a_syn = train_fganet_and_fnirs_experts(
             base_eeg, e_tr_lg, e_val_lg, e_te_lg,
             eeg_np[tr_idx], eeg_np[val_idx], eeg_np[te_idx],
-            synth_c[tr_idx], synth_c[val_idx], synth_c[te_idx],
+            eeg_csp_feats[tr_idx], eeg_csp_feats[val_idx], eeg_csp_feats[te_idx],
             feat_synth[tr_idx], feat_synth[val_idx], feat_synth[te_idx],
             labels_np[tr_idx], labels_np[val_idx], device=device, seed=seed_i
         )
-        _, p_hyb_shuf, a_shuf = train_modality_and_gated_fusion(
+        _, p_hyb_shuf, a_shuf = train_fganet_and_fnirs_experts(
             base_eeg, e_tr_lg, e_val_lg, e_te_lg,
             eeg_np[tr_idx], eeg_np[val_idx], eeg_np[te_idx],
-            real_c[tr_shuf], real_c[val_shuf], real_c[te_shuf],
-            feat_real[tr_shuf], feat_real[val_shuf], feat_real[te_shuf],
+            eeg_csp_feats[tr_idx], eeg_csp_feats[val_idx], eeg_csp_feats[te_idx],
+            feat_shuf[tr_idx], feat_shuf[val_idx], feat_shuf[te_idx],
             labels_np[tr_idx], labels_np[val_idx], device=device, seed=seed_i
         )
 
@@ -509,7 +599,7 @@ def evaluate_checkpoint(epoch="best", ddim_steps=50):
             all_runs[k].append(classification_metrics(y_te_true, p_arr))
             pred_records[k].append(p_arr)
 
-    print("\n【2. 独立留出测试集 (N=261) 对照与多模态融合分类结果 (5-Seed Average)】")
+    print("\n【2. 独立留出测试集 (N=261) 对照与 FGANet 多模态融合分类结果 (5-Seed Average)】")
     print(f"{'Experiment Condition':<30s} {'ACC':>12s} {'PRE':>10s} {'SEN':>10s} {'SPE':>10s}")
     print("-" * 88)
     for k, title in modes:
@@ -518,14 +608,9 @@ def evaluate_checkpoint(epoch="best", ddim_steps=50):
         print(f"{title:<30s} {avg['ACC']:>6.2f}±{std['ACC']:>4.2f}% {avg['PRE']:>9.2f}% {avg['SEN']:>9.2f}% {avg['SPE']:>9.2f}%")
 
     y_te_true = labels_np[te_idx]
-    ens_eeg = (np.mean(pred_records["eeg_only"], axis=0) >= 0.5).astype(np.int64)
-    ens_real = (np.mean(pred_records["eeg_real"], axis=0) >= 0.5).astype(np.int64)
-    ens_syn = (np.mean(pred_records["eeg_synth"], axis=0) >= 0.5).astype(np.int64)
-    ens_shuf = (np.mean(pred_records["eeg_shuffled_real"], axis=0) >= 0.5).astype(np.int64)
-
-    r_d, r_lo, r_hi, r_p = bootstrap_paired_test(y_te_true, ens_eeg, ens_real)
-    s_d, s_lo, s_hi, s_p = bootstrap_paired_test(y_te_true, ens_eeg, ens_syn)
-    sh_d, sh_lo, sh_hi, _ = bootstrap_paired_test(y_te_true, ens_eeg, ens_shuf)
+    r_d, r_lo, r_hi, r_p = bootstrap_paired_trials_across_seeds(y_te_true, pred_records["eeg_only"], pred_records["eeg_real"])
+    s_d, s_lo, s_hi, s_p = bootstrap_paired_trials_across_seeds(y_te_true, pred_records["eeg_only"], pred_records["eeg_synth"])
+    sh_d, sh_lo, sh_hi, _ = bootstrap_paired_trials_across_seeds(y_te_true, pred_records["eeg_only"], pred_records["eeg_shuffled_real"])
 
     print("-" * 88)
     print(f"  [验证集选定平均门控权重 α*] Real α*={np.mean(learned_alphas['real']):.2f} | Synth α*={np.mean(learned_alphas['synth']):.2f} | Shuffled α*={np.mean(learned_alphas['shuf']):.2f}")

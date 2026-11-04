@@ -3,10 +3,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def smooth_hemodynamic_trajectory(x: torch.Tensor) -> torch.Tensor:
+    """反射边界延拓零相位低通平滑 (消除 DDIM 采样高频毛刺，严格对齐 [-5s, 0s] 零基线)"""
+    x_s = F.avg_pool1d(F.pad(x, (6, 6), mode="reflect"), kernel_size=13, stride=1)
+    x_s = F.avg_pool1d(F.pad(x_s, (4, 4), mode="reflect"), kernel_size=9, stride=1)
+    return x_s - x_s[:, :, :50].mean(dim=-1, keepdim=True)
+
 class SCDMDiffusion(nn.Module):
     """
-    标准条件扩散模型 (Standard Conditional Diffusion Model):
-    直接对目标 fNIRS 信号 f_0 执行前向加噪与逆向 DDIM 去噪，无独立先验分支与 0.06 缩放魔改
+    标准 6-Block 条件扩散模型:
+    解决 "训练 x0_MSE=0.15 但采样 Val_MSE=1.23" 的训练-采样不一致问题
     """
     def __init__(self, unet, timesteps=200, beta_start=1e-4, beta_end=0.02, schedule="cosine"):
         super().__init__()
@@ -32,13 +38,8 @@ class SCDMDiffusion(nn.Module):
         ab = self.alpha_bar[t].view(-1, 1, 1)
         return torch.sqrt(ab) * x0 + torch.sqrt(1.0 - ab) * noise
 
-    def predict_eps_and_x0(self, e_0, f_t, t, topo_ef, topo_fe, corr_ef=None):
-        """
-        采用 v-prediction 参数化 (Salimans & Ho, ICLR 2022):
-        在低信噪比 (t->T) 时等价于预测噪声 eps，在高信噪比 (t->0) 时等价于预测信号 x_0，
-        彻底解决纯 eps 预测在 t->T 除零放大基线漂移、或纯 x0 预测缺乏高频去噪能力的问题
-        """
-        v_pred = self.unet(e_0, f_t, t, topo_ef, topo_fe, corr_ef)
+    def predict_eps_and_x0(self, e_0, f_t, t, topo_ef, topo_fe, corr_ef=None, spatial_affinity=None):
+        v_pred = self.unet(e_0, f_t, t, topo_ef, topo_fe, corr_ef, spatial_affinity)
         ab = self.alpha_bar[t].view(-1, 1, 1).clamp(min=1e-6, max=1.0 - 1e-6)
         sqrt_ab = torch.sqrt(ab)
         sqrt_one_minus_ab = torch.sqrt(1.0 - ab)
@@ -47,55 +48,70 @@ class SCDMDiffusion(nn.Module):
         x0_pred = sqrt_ab * f_t - sqrt_one_minus_ab * v_pred
         return eps_pred, x0_pred, v_pred
 
-    def compute_loss(self, e_0, f_0, topo_ef, topo_fe, corr_ef=None):
+    def compute_loss(self, e_0, f_0, topo_ef, topo_fe, corr_ef=None, spatial_affinity=None, fixed_t=None, fixed_noise=None):
         B = e_0.size(0)
-        t = torch.randint(0, self.timesteps, (B,), device=e_0.device).long()
-        noise = torch.randn_like(f_0)
+        if fixed_t is not None:
+            t = fixed_t
+        else:
+            # 50% 均匀采样全时间步，50% 重点采样高噪声步 t in [120, 199] (强迫模型在纯噪声起点依赖 EEG 条件恢复信号)
+            t_uni = torch.randint(0, self.timesteps, (B // 2,), device=e_0.device)
+            t_high = torch.randint(int(self.timesteps * 0.6), self.timesteps, (B - B // 2,), device=e_0.device)
+            t = torch.cat([t_uni, t_high], dim=0).long()
+
+        noise = fixed_noise if fixed_noise is not None else torch.randn_like(f_0)
         f_t = self.q_sample(f_0, t, noise)
 
         ab = self.alpha_bar[t].view(-1, 1, 1).clamp(min=1e-6, max=1.0 - 1e-6)
         v_target = torch.sqrt(ab) * noise - torch.sqrt(1.0 - ab) * f_0
 
-        eps_pred, x0_pred, v_pred = self.predict_eps_and_x0(e_0, f_t, t, topo_ef, topo_fe, corr_ef)
+        eps_pred, x0_pred, v_pred = self.predict_eps_and_x0(e_0, f_t, t, topo_ef, topo_fe, corr_ef, spatial_affinity)
 
-        # 1. 标准扩散噪声匹配损失 (等价于带 SNR 平衡的 ||eps - eps_theta||^2)
         noise_mse = F.mse_loss(eps_pred, noise)
         v_mse = F.mse_loss(v_pred, v_target)
         x0_mse = F.mse_loss(x0_pred, f_0)
+        curve_mse = F.mse_loss(x0_pred.mean(dim=0), f_0.mean(dim=0))
 
-        # 2. 试次级对比相关性约束 (减去 Batch 平均模板后计算余弦相似度，强迫模型保留每个试次的 LMI/RMI 差异！)
+        # 逐试次相关性与试次间特异性约束 (强迫保留单试次左右脑偏侧化差异)
+        x_flat = x0_pred.reshape(B, -1)
+        f_flat = f_0.reshape(B, -1)
+        sample_cos = F.cosine_similarity(
+            x_flat - x_flat.mean(dim=-1, keepdim=True),
+            f_flat - f_flat.mean(dim=-1, keepdim=True),
+            dim=-1, eps=1e-6
+        ).mean()
+
         if B > 2:
             x0_diff = x0_pred - x0_pred.mean(dim=0, keepdim=True)
             f0_diff = f_0 - f_0.mean(dim=0, keepdim=True)
             trial_spec_cos = F.cosine_similarity(x0_diff.flatten(1), f0_diff.flatten(1), dim=-1, eps=1e-6).mean()
         else:
-            trial_spec_cos = torch.tensor(0.0, device=e_0.device)
+            trial_spec_cos = sample_cos
 
-        total_loss = v_mse + 0.5 * x0_mse + 0.2 * (1.0 - trial_spec_cos)
+        total_loss = v_mse + 0.8 * x0_mse + 0.5 * curve_mse + 0.25 * (1.0 - sample_cos) + 0.25 * (1.0 - trial_spec_cos)
         return total_loss, {
             "total": total_loss.item(),
+            "v_mse": v_mse.item(),
             "noise_mse": noise_mse.item(),
             "prior_mse": x0_mse.item(),
             "x0_mse": x0_mse.item()
         }
 
     @torch.no_grad()
-    def sample(self, e_0, topo_ef, topo_fe, steps=50, corr_ef=None, eta=0.0):
-        """标准 DDIM 逆向去噪采样 (从纯高斯噪声 f_T ~ N(0,I) 完整采样生成 f_0，无 0.06 截断)"""
+    def sample(self, e_0, topo_ef, topo_fe, steps=50, corr_ef=None, spatial_affinity=None, seed=42):
+        """固定种子的确定性 DDIM 逆向去噪采样"""
         B, device = e_0.size(0), e_0.device
-        seq = torch.linspace(0, self.timesteps - 1, steps + 1, dtype=torch.long, device=device).flip(0)
-        ft = torch.randn(B, 36, 256, device=device)
+        gen = torch.Generator(device=device).manual_seed(seed)
+        ft = torch.randn((B, 36, 256), generator=gen, device=device)
 
+        seq = torch.linspace(0, self.timesteps - 1, steps + 1, dtype=torch.long, device=device).flip(0)
         for i in range(len(seq) - 1):
             t_cur, t_next = seq[i], seq[i + 1]
             tt = torch.full((B,), t_cur, device=device, dtype=torch.long)
 
-            eps_pred, x0_pred, _ = self.predict_eps_and_x0(e_0, ft, tt, topo_ef, topo_fe, corr_ef)
-            x0_pred = x0_pred.clamp(-4.0, 4.0)
+            eps_pred, x0_pred, _ = self.predict_eps_and_x0(e_0, ft, tt, topo_ef, topo_fe, corr_ef, spatial_affinity)
+            x0_pred = x0_pred.clamp(-3.0, 3.0)
 
             ab_next = self.alpha_bar[t_next].clamp(min=1e-8)
             ft = torch.sqrt(ab_next) * x0_pred + torch.sqrt(torch.clamp(1.0 - ab_next, min=0.0)) * eps_pred
 
-        # 仅将任务前 [-5s, 0s] (前50点) 静息基线归零，完整保留任务期幅值与空间通道分布
-        ft = ft - ft[:, :, :50].mean(dim=-1, keepdim=True)
-        return ft
+        return smooth_hemodynamic_trajectory(ft)

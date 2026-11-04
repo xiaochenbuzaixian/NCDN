@@ -1,4 +1,4 @@
-project_name: "NCDN_SCDM_Orthodox"
+project_name: "NCDN_SCDM_Scientific"
 seed: 42
 device: "cuda"
 
@@ -6,25 +6,23 @@ data:
   raw_dir: "datasets/raw"
   processed_dir: "datasets/processed"
   target_modality: "HbR"        # 可选 "HbR" 或 "HbO"
-  eeg_hrf: true                 # 条件输入特征: true 使用神经血管包络特征 (30,256), false 使用原始 EEG (30,4000)
+  eeg_hrf: true                 # 使用神经血管耦合包络特征 (30, 256)
   batch_size: 16
-  train_ratio: 0.7              # 70% 训练, 15% 验证, 15% 独立留出测试
+  train_ratio: 0.70             # 严格固定划分: 70% 训练 (1218), 15% 验证 (261), 15% 独立测试 (261)
 
 model:
-  base_channels: 32             # 严格对齐原论文: 共享表征 (32, 256) -> 16 -> 8 -> 4 -> 8 -> 16 -> 32
+  base_channels: 32             # 原论文共享表征: (32, 256) -> 16 -> 8 -> 4 -> 8 -> 16 -> 32
   time_dim: 64
-  n_blocks: 6                   # 严格对齐原论文: 6 个 Sample Blocks (3 Down + 3 Up)
+  n_blocks: 6                   # 原论文 6 个 Sample Blocks (3 Down + 3 Up)
   timesteps: 200
   schedule: "cosine"
   beta_start: 0.0001
   beta_end: 0.02
-  prediction_type: "v_or_x0"    # 标准条件扩散目标 (无 0.06 残差缩放)
-  use_prior_branch: false       # 消融开关: false 为标准直接扩散基线, true 为带先验分支消融变体
 
 train:
   epochs: 200
   lr: 0.0005
-  warmup_epochs: 20
+  warmup_epochs: 15
   weight_decay: 0.0001
   grad_clip_norm: 1.0
   save_interval: 20

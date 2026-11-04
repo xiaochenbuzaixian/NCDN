@@ -5,7 +5,7 @@ import numpy as np
 import scipy.io as sio
 from scipy.signal import cheby2, butter, sosfiltfilt, resample, hilbert, fftconvolve
 from scipy.special import gamma as gammafn
-from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
+from sklearn.model_selection import StratifiedShuffleSplit
 import torch
 from tqdm import tqdm
 
@@ -69,7 +69,6 @@ def eeg_to_hrf_features(eeg_trial, fs_eeg=160.0, n_out=256):
         c_deriv = fftconvolve(neural_drive[ch], dh, mode='full')[:n_samp]
         out[ch] = c_main + 0.3 * c_deriv
     res = resample(out, n_out, axis=1).astype(np.float32)
-    # 严格对齐任务前 [-5s, 0s] (前50点) 基线归零，保留试次间与通道间的真实幅值差异
     res = res - res[:, :50].mean(axis=1, keepdims=True)
     return res
 
@@ -128,12 +127,14 @@ def process_single_subject(sub_id, raw_dir):
 
     eeg_sessions = extract_mi_sessions(eeg_mat['cnt'], eeg_mrk_mat['mrk'])
     fnirs_sessions = extract_mi_sessions(fnirs_mat['cnt'], fnirs_mrk_mat['mrk'])
-    sos_fnirs = butter(6, [0.01, 0.1], btype='band', fs=10.0, output='sos')
+    assert len(eeg_sessions) == len(fnirs_sessions), f"被试 {sub_id} session 数量不匹配!"
+
     eeg_epochs, hbo_epochs, hbr_epochs, trial_labels, sub_ids = [], [], [], [], []
 
-    for (cnt_e, mrk_e), (cnt_f, mrk_f) in zip(eeg_sessions, fnirs_sessions):
+    for s_idx, ((cnt_e, mrk_e), (cnt_f, mrk_f)) in enumerate(zip(eeg_sessions, fnirs_sessions)):
         fs_e = float(cnt_e.fs)
         fs_f = float(cnt_f.fs)
+
         if hasattr(cnt_e, 'clab'):
             clab = [str(c) for c in np.array(cnt_e.clab).flatten()]
             eeg_idx = [i for i, name in enumerate(clab) if name not in ('VEOG', 'HEOG')][:30]
@@ -141,31 +142,47 @@ def process_single_subject(sub_id, raw_dir):
             eeg_idx = list(range(30))
         e_raw = np.array(cnt_e.x[:, eeg_idx], dtype=np.float64).T
         e_proc = preprocess_eeg_continuous(e_raw, fs_in=fs_e, fs_out=160.0)
+
+        # 严格按照原论文: 先在原始采样率 fs_f (12.5Hz) 下执行 0.01-0.1Hz 带通滤波，再降采样至 10Hz
         f_raw = np.array(cnt_f.x, dtype=np.float64)
         od_low, od_high = f_raw[:, :36].T, f_raw[:, 36:72].T
         hbo_cont, hbr_cont = mbll_from_od(od_low, od_high)
+
+        sos_fnirs = butter(6, [0.01, 0.1], btype='band', fs=fs_f, output='sos')
         hbo_filt = sosfiltfilt(sos_fnirs, hbo_cont, axis=1)
         hbr_filt = sosfiltfilt(sos_fnirs, hbr_cont, axis=1)
-        if abs(fs_f - 10.0) > 0.1:
+
+        if abs(fs_f - 10.0) > 1e-3:
             n_out_f = int(round(hbo_filt.shape[1] * 10.0 / fs_f))
             hbo_filt = resample(hbo_filt, n_out_f, axis=1)
             hbr_filt = resample(hbr_filt, n_out_f, axis=1)
+
         times_e = np.array(mrk_e.time).flatten().astype(np.float64)
         times_f = np.array(mrk_f.time).flatten().astype(np.float64)
-        labels = parse_trial_labels(mrk_e)
+        labels_e = parse_trial_labels(mrk_e)
+        labels_f = parse_trial_labels(mrk_f)
+
+        assert len(times_e) == len(times_f), f"Sub {sub_id} Sess {s_idx}: 事件数不一致"
+        assert np.array_equal(labels_e, labels_f), f"Sub {sub_id} Sess {s_idx}: 标签不一致"
+        rel_diff = np.max(np.abs((times_e - times_e[0]) - (times_f - times_f[0])))
+        assert rel_diff < 200.0, f"Sub {sub_id} Sess {s_idx}: 试次间时钟漂移过大 ({rel_diff:.1f} ms)"
+
         for idx in range(len(times_e)):
             e_onset = int(round(times_e[idx] / 1000.0 * 160.0))
             e_start = max(0, min(e_onset - int(5.0 * 160.0), e_proc.shape[1] - 4000))
             e_trial = e_proc[:, e_start:e_start + 4000]
+
             f_onset = int(round(times_f[idx] / 1000.0 * 10.0))
             f_start = max(0, min(f_onset - int(5.0 * 10.0), hbo_filt.shape[1] - 256))
             hbo_trial = hbo_filt[:, f_start:f_start + 256]
             hbr_trial = hbr_filt[:, f_start:f_start + 256]
+
             eeg_epochs.append(e_trial.astype(np.float32))
             hbo_epochs.append(np.clip(hbo_trial, -1e10, 1e10).astype(np.float32))
             hbr_epochs.append(np.clip(hbr_trial, -1e10, 1e10).astype(np.float32))
-            trial_labels.append(int(labels[idx]))
+            trial_labels.append(int(labels_e[idx]))
             sub_ids.append(sub_id - 1)
+
     return (np.stack(eeg_epochs, axis=0),
             np.stack(hbo_epochs, axis=0),
             np.stack(hbr_epochs, axis=0),
@@ -191,51 +208,50 @@ def main():
     labels = np.concatenate(all_labels, axis=0)
     subs = np.concatenate(all_subs, axis=0)
 
-    # 生成全局唯一、严格分层的数据集划分索引 (70% 训练, 15% 验证, 15% 留出测试 + 真正的 5-Fold 交叉验证)
-    print(">>> [Step 2/4] 构建全局统一的训练/验证/测试集与严格 5 折交叉验证划分 (消除数据泄漏)...")
-    strata = subs * 2 + labels  # 按 (被试, 类别) 联合分层
+    print(">>> [Step 2/4] 构建全局唯一固定划分 (方案 A: 70% Train=1218, 15% Val=261, 15% Test=261)...")
+    strata = subs * 2 + labels
     sss1 = StratifiedShuffleSplit(n_splits=1, test_size=0.30, random_state=42)
     train_idx, temp_idx = next(sss1.split(eeg, strata))
     sss2 = StratifiedShuffleSplit(n_splits=1, test_size=0.50, random_state=42)
     val_rel, test_rel = next(sss2.split(eeg[temp_idx], strata[temp_idx]))
-    val_idx, test_idx = temp_idx[val_rel], temp_idx[test_rel]
-
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    cv_folds = []
-    for f_tr, f_te in skf.split(eeg, strata):
-        cv_folds.append({"train": f_tr.tolist(), "test": f_te.tolist()})
+    val_idx, test_idx = np.sort(temp_idx[val_rel]), np.sort(temp_idx[test_rel])
+    train_idx = np.sort(train_idx)
 
     split_info = {
+        "protocol": "Scheme_A_Fixed_Holdout_70_15_15",
         "train_indices": train_idx.tolist(),
         "val_indices": val_idx.tolist(),
-        "test_indices": test_idx.tolist(),
-        "cv_5fold": cv_folds
+        "test_indices": test_idx.tolist()
     }
     with open(os.path.join(save_dir, "split_indices.json"), "w") as f:
-        json.dump(split_info, f)
+        json.dump(split_info, f, indent=2)
+    with open(os.path.join("outputs", "split_hbr.json"), "w") as f:
+        json.dump(split_info, f, indent=2)
 
-    print(">>> [Step 3/4] 执行任务前基线归零与基于训练集统计量的标准化 (保留试次间与通道间幅值信息)...")
+    print(">>> [Step 3/4] 执行任务前 [-5s, 0s] 基线归零与基于训练集 (被试×通道) 的稳健单位方差标准化...")
     for i in range(len(eeg)):
         mu = eeg[i, :, :800].mean(axis=1, keepdims=True)
         std = eeg[i].std(axis=1, keepdims=True)
         eeg[i] = (eeg[i] - mu) / np.where(std < 1e-8, 1.0, std)
 
     for arr in (hbo, hbr):
-        # 1. 仅减去任务前 [-5s, 0s] (前50点) 静息基线，绝不减去全时段均值，完整保留任务期响应幅值与偏侧化！
+        # 1. 减去任务前 [-5s, 0s] (前50点) 静息基线
         arr -= arr[:, :, :50].mean(axis=-1, keepdims=True)
-        # 2. 按每个被试在训练集内的标准差归一化，避免抹平试次间与通道间的运动想象差异
+        # 2. 按每个被试、每个通道在训练集任务期的标准差归一化，既防止坏道压制正常通道，又保留试次间幅值对比
         for s_id in np.unique(subs):
             s_mask = (subs == s_id)
-            s_tr_mask = np.intersect1d(np.where(s_mask)[0], train_idx)
-            scale_ref = arr[s_tr_mask].std() if len(s_tr_mask) > 0 else arr[s_mask].std()
-            arr[s_mask] /= max(float(scale_ref), 1e-8)
+            s_tr_idx = np.intersect1d(np.where(s_mask)[0], train_idx)
+            ref_idx = s_tr_idx if len(s_tr_idx) > 0 else np.where(s_mask)[0]
+            ch_std = arr[ref_idx, :, 50:].std(axis=(0, 2), keepdims=True)
+            ch_std = np.where(ch_std < 1e-8, 1.0, ch_std)
+            arr[s_mask] = np.clip(arr[s_mask] / ch_std, -4.5, 4.5)
 
     print(f">>> [Step 4/4] 提取神经血管耦合特征 ({len(eeg)}, 30, 256)...")
     eeg_hrf = np.empty((len(eeg), 30, 256), dtype=np.float32)
     for i in tqdm(range(len(eeg)), desc="HRF 特征计算"):
         eeg_hrf[i] = eeg_to_hrf_features(eeg[i], fs_eeg=160.0, n_out=256)
-    hrf_train_std = eeg_hrf[train_idx].std(axis=(0, 2), keepdims=True)
-    eeg_hrf = eeg_hrf / np.maximum(hrf_train_std, 1e-6)
+    hrf_train_std = eeg_hrf[train_idx, :, 50:].std(axis=(0, 2), keepdims=True)
+    eeg_hrf = np.clip(eeg_hrf / np.maximum(hrf_train_std, 1e-6), -4.5, 4.5)
 
     torch.save(torch.from_numpy(eeg), os.path.join(save_dir, "eeg_epochs.pt"))
     torch.save(torch.from_numpy(eeg_hrf), os.path.join(save_dir, "eeg_hrf_epochs.pt"))

@@ -1,5 +1,7 @@
 import os
+import csv
 import math
+import time
 import yaml
 import torch
 import numpy as np
@@ -25,12 +27,16 @@ def main():
     modality = cfg["data"]["target_modality"]
     processed_dir = cfg["data"]["processed_dir"]
     use_hrf = cfg["data"].get("eeg_hrf", True)
+    exp_id = f"SCDM_{modality}_{time.strftime('%Y%m%d_%H%M%S')}"
 
     topo_dict = torch.load(os.path.join(processed_dir, f"topo_{modality.lower()}.pt"), map_location="cpu")
     topo_ef, topo_fe = topo_dict["topo_ef"].to(device), topo_dict["topo_fe"].to(device)
     corr_ef = topo_dict.get("corr_ef", None)
+    spatial_affinity = topo_dict.get("spatial_affinity", None)
     if corr_ef is not None:
         corr_ef = corr_ef.to(device)
+    if spatial_affinity is not None:
+        spatial_affinity = spatial_affinity.to(device)
 
     train_loader, val_loader = get_dataloaders(
         processed_dir, modality,
@@ -47,11 +53,16 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=1e-4)
     epochs = cfg["train"]["epochs"]
-    warmup = cfg["train"].get("warmup_epochs", 20)
+    warmup = cfg["train"].get("warmup_epochs", 15)
     peak_lr = cfg["train"]["lr"]
-    best_score = -999.0
+    best_ddim_score = -999.0
 
-    print(f">>> 启动 6-Block 标准 SCDM 条件扩散训练 | 设备: {device} | 训练样本: {len(train_loader.dataset)} | 验证样本: {len(val_loader.dataset)}")
+    csv_path = os.path.join(cfg["train"]["output_dir"], f"train_log_{modality.lower()}.csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["exp_id", "epoch", "lr", "train_total", "train_noise_mse", "train_x0_mse", "val_ddim_mse", "val_spcc", "val_cpcc"])
+
+    print(f">>> 启动 6-Block SCDM 训练 [{exp_id}] | 设备: {device} | 训练: {len(train_loader.dataset)} | 验证: {len(val_loader.dataset)}")
 
     for epoch in range(1, epochs + 1):
         lr = cosine_lr(epoch - 1, warmup, epochs, peak_lr)
@@ -59,34 +70,35 @@ def main():
             pg["lr"] = lr
 
         model.train()
-        sums = {"total": 0.0, "noise_mse": 0.0, "prior_mse": 0.0}
+        sums = {"total": 0.0, "noise_mse": 0.0, "x0_mse": 0.0}
         pbar = tqdm(train_loader, desc=f"Epoch [{epoch:03d}/{epochs:03d}]", leave=False)
 
         for batch in pbar:
             e_in = batch["eeg_hrf" if use_hrf else "eeg"].to(device)
             f_0 = batch["fnirs"].to(device)
             optimizer.zero_grad()
-            loss, l_dict = model.compute_loss(e_in, f_0, topo_ef, topo_fe, corr_ef=corr_ef)
+            loss, l_dict = model.compute_loss(e_in, f_0, topo_ef, topo_fe, corr_ef=corr_ef, spatial_affinity=spatial_affinity)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             for k in sums:
                 sums[k] += l_dict[k]
-            pbar.set_postfix({"n_mse": f"{l_dict['noise_mse']:.4f}", "x0_mse": f"{l_dict['prior_mse']:.4f}"})
+            pbar.set_postfix({"n_mse": f"{l_dict['noise_mse']:.4f}", "x0_mse": f"{l_dict['x0_mse']:.4f}"})
 
         n = len(train_loader)
-        print(f"Ep [{epoch:03d}/{epochs:03d}] | LR: {lr:.2e} | Noise_MSE: {sums['noise_mse']/n:.4f} | x0_MSE: {sums['prior_mse']/n:.4f}")
+        tr_tot, tr_nmse, tr_x0 = sums["total"] / n, sums["noise_mse"] / n, sums["x0_mse"] / n
+        print(f"Ep [{epoch:03d}/{epochs:03d}] | LR: {lr:.2e} | Noise_MSE: {tr_nmse:.4f} | x0_MSE: {tr_x0:.4f}")
 
-        if epoch % 10 == 0 or epoch == epochs:
+        # 每 5 轮在验证集上执行真实 DDIM 逆向去噪采样，以真实生成表现选优保存检查点
+        if epoch % 5 == 0 or epoch == epochs:
             model.eval()
             reals, synths = [], []
             with torch.no_grad():
-                for vb in val_loader:
+                for b_i, vb in enumerate(val_loader):
                     ve = vb["eeg_hrf" if use_hrf else "eeg"].to(device)
                     vf = vb["fnirs"].numpy()
-                    sf = model.sample(ve, topo_ef, topo_fe, steps=25, corr_ef=corr_ef).cpu().numpy()
-                    reals.append(vf)
-                    synths.append(sf)
+                    sf = model.sample(ve, topo_ef, topo_fe, steps=25, corr_ef=corr_ef, spatial_affinity=spatial_affinity, seed=3000 + b_i).cpu().numpy()
+                    reals.append(vf); synths.append(sf)
             reals = np.concatenate(reals, axis=0)
             synths = np.concatenate(synths, axis=0)
             val_mse = float(np.mean((reals - synths) ** 2))
@@ -97,13 +109,24 @@ def main():
             ]
             val_spcc = float(np.mean(corrs))
             val_cpcc, _ = pearsonr(reals.mean(axis=(0, 1)), synths.mean(axis=(0, 1)))
-            score = val_spcc + 0.5 * val_cpcc - 0.3 * val_mse
-            print(f"  --> [验证集 N={len(reals)}] MSE: {val_mse:.4f} | 单试次 PCC: {val_spcc:.4f} | 曲线 PCC: {val_cpcc:.4f}")
+            ddim_score = val_cpcc + 2.0 * val_spcc - 0.5 * val_mse
 
-            if score > best_score:
-                best_score = score
-                torch.save(model.state_dict(), os.path.join(cfg["train"]["checkpoint_dir"], f"scdm_{modality.lower()}_best.pt"))
-                print(f"  ★ 已更新最佳模型 (Val MSE: {val_mse:.4f}, Sample PCC: {val_spcc:.4f}, Curve PCC: {val_cpcc:.4f})")
+            with open(csv_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([exp_id, epoch, f"{lr:.6e}", f"{tr_tot:.6f}", f"{tr_nmse:.6f}", f"{tr_x0:.6f}", f"{val_mse:.6f}", f"{val_spcc:.6f}", f"{val_cpcc:.6f}"])
+
+            print(f"  --> [验证集 DDIM 采样 N={len(reals)}] MSE: {val_mse:.4f} | 单试次 PCC: {val_spcc:+.4f} | 曲线 PCC: {val_cpcc:+.4f}")
+
+            if ddim_score > best_ddim_score:
+                best_ddim_score = ddim_score
+                torch.save({
+                    "model": model.state_dict(),
+                    "exp_id": exp_id,
+                    "epoch": epoch,
+                    "val_mse": val_mse,
+                    "val_cpcc": val_cpcc
+                }, os.path.join(cfg["train"]["checkpoint_dir"], f"scdm_{modality.lower()}_best.pt"))
+                print(f"  ★ 已更新最佳 DDIM 生成模型 (Epoch {epoch} | Val_MSE: {val_mse:.4f}, Curve_PCC: {val_cpcc:+.4f})")
 
         if epoch == epochs:
             torch.save(model.state_dict(), os.path.join(cfg["train"]["checkpoint_dir"], f"scdm_{modality.lower()}_ep{epoch}.pt"))

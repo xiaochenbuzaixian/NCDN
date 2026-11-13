@@ -51,7 +51,7 @@ def train_variant(variant_code, save_filename, epochs, val_interval, train_loade
     best_score = -999.0
 
     print("\n" + "=" * 88)
-    print(f">>> 启动训练 [{variant_code}] (2×SCG + 2×MTR 交替架构) -> 保存至: {save_filename} | 总轮数: {epochs}")
+    print(f">>> 启动训练 [{variant_code}] (同相双峰 2×SCG + 2×MTR 交替架构) -> {save_filename} | 轮数: {epochs}")
     print("=" * 88)
 
     for epoch in range(1, epochs + 1):
@@ -140,11 +140,10 @@ def main():
         topo_ef=topo_ef, topo_fe=topo_fe, topo_ff=topo_ff, corr_ef=corr_ef, spatial_affinity=spatial_affinity,
         cfg=cfg, device=device
     )
-    # 同步备份一份至 scdm_hbr_best.pt
     dual_p = os.path.join(ckpt_dir, "scdm_dual_best.pt")
     torch.save(torch.load(dual_p), os.path.join(ckpt_dir, "scdm_hbr_best.pt"))
 
-    # 2. 依次训练其余 4 组原论文消融实验变体 (各 60 Epochs，确保全部 5 组权重真实存盘)
+    # 2. 依次训练其余 4 组原论文消融实验变体 (各 60 Epochs)
     ablation_plan = [
         ("ATTN_COV",      "scdm_abl_1_attn_cov.pt",      60),
         ("ATTN_MTR",      "scdm_abl_2_attn_mtr.pt",      60),
@@ -159,7 +158,7 @@ def main():
             cfg=cfg, device=device
         )
 
-    print("\n✅ 全部 5 套模型权重重新训练完成！现在请运行 `CUDA_VISIBLE_DEVICES=1 python evaluate.py` 查看全部评估结果。")
+    print("\n✅ 全部 5 套模型权重重新训练完成！现在请运行 `CUDA_VISIBLE_DEVICES=1 python evaluate.py` 查看结果。")
 
 if __name__ == "__main__":
     main()

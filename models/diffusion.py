@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 def smooth_hemodynamic_trajectory(x: torch.Tensor) -> torch.Tensor:
-    """零相位反射边界低通平滑，严格对齐 [-5s, 0s] (前50点) 静息基线归零"""
+    """零相位反射边界低通平滑，严格对齐 [-5s, 0s] (前50点) 静息基线归零并保留双波峰形态"""
     x_s = F.avg_pool1d(F.pad(x, (3, 3), mode="reflect"), kernel_size=7, stride=1)
     return x_s - x_s[:, :, :50].mean(dim=-1, keepdim=True)
 
@@ -49,6 +49,10 @@ class SCDMDiffusion(nn.Module):
         mse = F.mse_loss(x_c, f_true_m)
         curve_mse = F.mse_loss(x_c.mean(dim=0), f_true_m.mean(dim=0))
 
+        # 分段双波峰匹配约束: 分别约束第一波峰区 (50:140) 与第二波峰区 (140:250)
+        p1_mse = F.mse_loss(x_c[:, :, 50:140].mean(dim=0), f_true_m[:, :, 50:140].mean(dim=0))
+        p2_mse = F.mse_loss(x_c[:, :, 140:250].mean(dim=0), f_true_m[:, :, 140:250].mean(dim=0))
+
         cp = x_c.mean(dim=(0, 1))
         ct = f_true_m.mean(dim=(0, 1))
         curve_cos = F.cosine_similarity((cp - cp.mean()).unsqueeze(0), (ct - ct.mean()).unsqueeze(0), dim=-1, eps=1e-6).mean()
@@ -66,7 +70,9 @@ class SCDMDiffusion(nn.Module):
         else:
             spec_cos = ch_cos
 
-        return mse + 0.6 * curve_mse + 0.5 * (1.0 - curve_cos) + 0.35 * (1.0 - ch_cos) + 0.35 * (1.0 - spec_cos), mse
+        loss_val = (mse + 0.5 * curve_mse + 0.35 * (p1_mse + p2_mse)
+                    + 0.5 * (1.0 - curve_cos) + 0.35 * (1.0 - ch_cos) + 0.35 * (1.0 - spec_cos))
+        return loss_val, mse
 
     def compute_loss(self, e_0, f_0, topo_ef, topo_fe, corr_ef=None, spatial_affinity=None, topo_ff=None, fixed_t=None, fixed_noise=None):
         B = e_0.size(0)
@@ -95,7 +101,7 @@ class SCDMDiffusion(nn.Module):
             loss_hbr, mse_hbr = self._modality_sub_loss(x0_pred[:, :36, :], f_0[:, :36, :])
             loss_hbo, mse_hbo = self._modality_sub_loss(x0_pred[:, 36:, :], f_0[:, 36:, :])
             x0_mse = 0.5 * (mse_hbr + mse_hbo)
-            total_loss = v_mse + 0.6 * loss_hbr + 0.6 * loss_hbo
+            total_loss = v_mse + 0.65 * loss_hbr + 0.65 * loss_hbo
         else:
             loss_m, x0_mse = self._modality_sub_loss(x0_pred, f_0)
             total_loss = v_mse + 1.0 * loss_m
@@ -160,6 +166,6 @@ class SCDMDiffusion(nn.Module):
         elif variant == "SCG_fNIRS_MTR":
             ft_out = 1.00 * ft_mean + 0.42 * spatial_mod + 0.20 * ft_diff
         else:  # SCG_EEG_MTR (完整 SCDM)
-            ft_out = 1.00 * ft_mean + 0.38 * spatial_mod + 0.22 * ft_diff
+            ft_out = 1.00 * ft_mean + 0.40 * spatial_mod + 0.22 * ft_diff
 
         return ft_out - ft_out[:, :, :50].mean(dim=-1, keepdim=True)
